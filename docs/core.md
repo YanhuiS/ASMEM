@@ -152,6 +152,26 @@ QUERIES ALREADY RUN
 
 ---
 
+### 3.6 超时、队列与降级
+
+搜索不会因为一个慢模型调用把请求拖成空结果：
+
+- **硬超时覆盖排队时间。** `search_sem` 的等待在 `asyncio.wait_for` 之内；拿不到 slot
+  超过 `search_queue_timeout` 直接走 fallback，而不是排到整个硬超时。
+- **模型调用前先落 coarse fallback。** `run_search` 在 gate/loop 之前把 top coarse
+  证据写到 API 给的临时文件；硬超时/异常时 API 读取该文件返回，不再固定返回 `data: []`。
+- **文件为空时 BM25-only 兜底。** `quick_coarse_fallback` 关闭 dense，只用
+  BM25/exact/time/state 生成短候选，不调用生成式或 embedding 模型。
+- **dense 超时不再清空候选。** 粗筛 dense 超时会再用 BM25-only 跑一次
+  （`_bm25_only_config`），避免 `evidence=0`。
+- **只有带 `request_id` 的请求才在客户端断开后继续运行**；无 `request_id` 的请求被取消，
+  立即释放 `search_sem`，避免僵尸任务占满并发。
+- **进程级 endpoint breaker**：`llm_global_breaker_failures > 0` 时，端点连续失败会打开
+  全局熔断，新请求快速进入 coarse fallback，而不是各自重试。
+- **上下文保护**：`model_input_token_cap` 在每次模型调用前做 token 预检；
+  端点返回 context overflow 时，`ModelRunner` 会把 prompt 缩到 1/2、1/4 再试一次
+  （`context_overflow_retries`），仍失败才降级。
+
 ## 4. API
 
 `/add` 和 `/search` 与 benchmark 使用同一套实现：
@@ -175,6 +195,20 @@ loop_force_intents: []
 loop_accept_answer_types: []
 gate_check_consistency: true
 pre_audit: false
+# Timeout / queue / fallback
+search_queue_timeout: 60
+fallback_enabled: true
+fallback_timeout: 20
+fallback_concurrency: 8
+fallback_evidence_limit: 12
+llm_global_breaker_failures: 8
+llm_global_breaker_cooldown: 30
+# Context protection
+model_input_token_cap: 24000
+model_output_reserve_tokens: 4096
+context_overflow_retries: 1
+verifier_max_output_tokens: 2048
+postagent_max_output_tokens: 4096
 ```
 
 API 只改 generator/embedding endpoint、`concurrency`、`store_dir` 等部署项；

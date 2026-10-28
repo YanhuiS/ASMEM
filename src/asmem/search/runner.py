@@ -22,7 +22,7 @@ from ..io import read_jsonl
 from ..log import Logger
 from .config import CONFIG_FILE, DEFAULT_CONFIG, call_config, load_config
 from .model import ModelRunner, _accepts_deadline
-from .pipeline import _payload_key, run_question
+from .pipeline import _payload_key, quick_coarse_fallback, run_question
 from .workspace import _run_id
 
 __all__ = [
@@ -31,6 +31,7 @@ __all__ = [
     "ModelRunner",
     "call_config",
     "load_config",
+    "quick_coarse_fallback",
     "run_question",
 ]
 
