@@ -77,6 +77,15 @@ def _attach_source_times(
     return evidence
 
 
+def _with_verification(items: list[dict[str, Any]],
+                       label: str) -> list[dict[str, Any]]:
+    """Clone coarse items with a stage-specific verification label."""
+    return [{
+        "content": str(item.get("content") or ""),
+        "metadata": {**(item.get("metadata") or {}), "verification": label},
+    } for item in items if str(item.get("content") or "").strip()]
+
+
 def _compact_for_verifier(
     records: list[dict[str, Any]],
     config: dict[str, Any],
@@ -239,6 +248,23 @@ def _load_coarse_source(
                         index=None)
 
 
+def _bm25_only_config(config: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``config`` with dense retrieval disabled.
+
+    Used when the embedding endpoint is slow/down: BM25 + exact + time + state
+    are deterministic and fast, so they can still produce a coarse shortlist
+    instead of an empty result and a hard timeout.
+    """
+    cfg = dict(config)
+    retrieval = dict(cfg.get("retrieval") or {})
+    retrieval["mode"] = "bm25"
+    dense = dict(retrieval.get("dense") or {})
+    dense.update({"mode": "off", "model": "", "base_url": ""})
+    retrieval["dense"] = dense
+    cfg["retrieval"] = retrieval
+    return cfg
+
+
 async def _coarse_or_empty(
     memory_path: Path,
     question: str,
@@ -253,14 +279,62 @@ async def _coarse_or_empty(
             memory_path, question, options=options, config=config,
             out_dir=inputs, cache_dir=cache_dir)
     except Exception as exc:  # noqa: BLE001 - coarse failure must not kill search
-        records = read_jsonl(memory_path)
-        return CoarseResult(
-            candidates=[],
-            info={"query": question, "route": "dialogue", "records": len(records),
-                  "warnings": [f"coarse failed: {type(exc).__name__}: {exc}"]},
-            records=records,
-            index=None,
-        )
+        # The usual failure here is the dense endpoint (timeout/connection).
+        # Retry once with BM25-only before accepting an empty candidate pool.
+        try:
+            fallback = await run_coarse(
+                memory_path, question, options=options,
+                config=_bm25_only_config(config),
+                out_dir=inputs, cache_dir=cache_dir)
+            fallback.info.setdefault("warnings", []).append(
+                f"bm25 fallback after {type(exc).__name__}: {exc}")
+            return fallback
+        except Exception as inner:  # noqa: BLE001
+            records = read_jsonl(memory_path)
+            return CoarseResult(
+                candidates=[],
+                info={"query": question, "route": "dialogue",
+                      "records": len(records),
+                      "warnings": [
+                          f"coarse failed: {type(exc).__name__}: {exc}",
+                          f"bm25 fallback failed: {type(inner).__name__}: {inner}",
+                      ]},
+                records=records,
+                index=None,
+            )
+
+
+async def quick_coarse_fallback(
+    *,
+    memory_path: Path,
+    question: str,
+    config: dict[str, Any],
+    options: list[str] | None = None,
+    cache_dir: Path | None = None,
+    limit: int = 12,
+    timeout: float = 20.0,
+) -> list[dict[str, Any]]:
+    """A model-free, BM25-only shortlist for the API hard-timeout path.
+
+    This is deliberately outside ``run_search``: it must work even when every
+    search slot is occupied by a hung model call.  It never calls a generative
+    or embedding model, and its own timeout is small.
+    """
+    cfg = _bm25_only_config(config)
+    try:
+        coro = run_coarse(
+            memory_path, question, options=list(options or []),
+            config=cfg, cache_dir=cache_dir)
+        coarse = (await asyncio.wait_for(coro, timeout=timeout)
+                  if timeout > 0 else await coro)
+    except Exception:  # noqa: BLE001 - fallback failure is still a valid []
+        return []
+    route = str((coarse.info or {}).get("route") or "dialogue")
+    items = fallback_evidence(
+        coarse.candidates, coarse.records, question=question, route=route,
+        config=config, limit=max(1, int(limit)),
+        verification="bm25_fallback")
+    return _attach_source_times(items, coarse.records)
 
 
 #: One lock per deterministic run directory.  Two HTTP retries with the same
@@ -335,6 +409,7 @@ async def run_question(
     user_id: str = "",
     coarse_source: Path | None = None,
     query_images: list[str] | None = None,
+    fallback_path: Path | None = None,
 ) -> dict[str, Any]:
     """Entry point used by the HTTP API.
 
@@ -358,7 +433,8 @@ async def run_question(
             run_root=run_root, model=model, log=log, dry_run=dry_run,
             options=normalized, cache_dir=cache_dir, shared_dir=shared_dir,
             dataset=dataset, answer_type=answer_type,
-            coarse_source=coarse_source, query_images=images)
+            coarse_source=coarse_source, query_images=images,
+            fallback_path=fallback_path)
     request_key = f"{user_id}\0{request_id}"
     payload_key = _payload_key(memory_path, question, normalized, images)
     name = _run_id(question, request_key, payload_key)
@@ -371,7 +447,7 @@ async def run_question(
                 options=normalized, cache_dir=cache_dir, shared_dir=shared_dir,
                 dataset=dataset, answer_type=answer_type, request_key=request_key,
                 payload_key=payload_key, coarse_source=coarse_source,
-                query_images=images)
+                query_images=images, fallback_path=fallback_path)
     finally:
         # Keep the lock table bounded on a long-lived API process.
         if len(_RUN_LOCKS) > 1024:
@@ -398,6 +474,7 @@ async def run_search(
     payload_key: str = "",
     coarse_source: Path | None = None,
     query_images: list[str] | None = None,
+    fallback_path: Path | None = None,
 ) -> dict[str, Any]:
     log = log or Logger.from_config(config, prefix="search")
     options = [str(item) for item in (options or []) if str(item).strip()]
@@ -516,14 +593,26 @@ async def run_search(
                         cache_dir=cache_dir),
                     timeout=coarse_remaining)
             except asyncio.TimeoutError:
-                # Coarse recall (usually the embedding call) exceeded the request
-                # budget.  Keep the snapshot so the agent can still grep it.
-                coarse = CoarseResult(
-                    candidates=[],
-                    info={"query": question, "route": "dialogue",
-                          "records": len(read_jsonl(snapshot)),
-                          "warnings": ["coarse deadline exceeded"]},
-                    records=read_jsonl(snapshot))
+                # Coarse recall (usually the embedding call) exceeded the
+                # request budget.  Do not return an empty candidate pool:
+                # BM25 is deterministic and fast, so one short retry still
+                # gives the agent and the fallback path a shortlist.
+                try:
+                    coarse = await asyncio.wait_for(
+                        _coarse_or_empty(
+                            snapshot, question, options,
+                            _bm25_only_config(config), inputs,
+                            cache_dir=cache_dir),
+                        timeout=max(5.0, min(30.0, coarse_remaining)))
+                    coarse.info.setdefault("warnings", []).append(
+                        "dense coarse stage timed out; bm25 fallback")
+                except Exception:  # noqa: BLE001
+                    coarse = CoarseResult(
+                        candidates=[],
+                        info={"query": question, "route": "dialogue",
+                              "records": len(read_jsonl(snapshot)),
+                              "warnings": ["coarse deadline exceeded"]},
+                        records=read_jsonl(snapshot))
     coarse.info.setdefault("coarse_version", COARSE_CACHE_VERSION)
     route = str((coarse.info or {}).get("route") or "dialogue")
     candidates = coarse.candidates
@@ -552,6 +641,33 @@ async def run_search(
         coarse_reused = False
         coarse.info["mode"] = "agent"
         (inputs / "candidates.jsonl").write_text("", encoding="utf-8")
+
+    # Materialize a model-free shortlist BEFORE the first model call and, when
+    # the API supplied a path, write it to disk.  If the request then hits the
+    # hard timeout while the gate/loop is hanging, the API can still return
+    # these records instead of an empty ``data: []``.
+    fallback_items: list[dict[str, Any]] = []
+    if candidates and route != "self_contained":
+        try:
+            fallback_limit = int(
+                config.get("fallback_evidence_limit",
+                           gate_evidence_limit(config))
+                or gate_evidence_limit(config))
+            fallback_items = _attach_source_times(
+                fallback_evidence(
+                    candidates, records, question=question, route=route,
+                    config=config, limit=max(1, fallback_limit),
+                    verification="coarse_fallback"),
+                records)
+        except Exception as exc:  # noqa: BLE001 - fallback must not kill search
+            fallback_items = []
+            log.warning(
+                f"fallback evidence failed: {type(exc).__name__}: {exc}")
+    if fallback_path is not None:
+        try:
+            evidence.write_file(Path(fallback_path), fallback_items)
+        except Exception:  # noqa: BLE001 - fallback must not kill search
+            pass
 
     local = dict(config)
     local["question"] = question
@@ -607,10 +723,7 @@ async def run_search(
             # Coarse-only mode: return the shortlist as evidence, no agent and
             # no verifier.  This is the latency/availability baseline.
             if mode == "coarse":
-                raw_evidence = fallback_evidence(
-                    candidates, records, question=question, route=route,
-                    config=config, limit=gate_evidence_limit(config),
-                    verification="coarse_mode")
+                raw_evidence = _with_verification(fallback_items, "coarse_mode")
                 verdict = verifier.Verdict(
                     sufficient=bool(raw_evidence), missing=[],
                     reasoning="coarse-only mode")
@@ -632,10 +745,8 @@ async def run_search(
             if (gate.sufficient and mode != "coarse" and not resumed
                     and not fixed_pipeline and not pipeline_mode
                     and not gate_loop_mode):
-                coarse_evidence = fallback_evidence(
-                    candidates, records, question=question, route=route,
-                    config=config, limit=gate_evidence_limit(config),
-                    verification="coarse_sufficient")
+                coarse_evidence = _with_verification(
+                    fallback_items, "coarse_sufficient")
                 if gate_verify(config) and coarse_evidence:
                     coarse_evidence = _attach_source_times(coarse_evidence, records)
                     verdict = await verifier.verify(
@@ -682,10 +793,8 @@ async def run_search(
             accept_coarse = str(answer_type or "").lower() in accept_types
             if (gate_loop_mode and mode != "coarse" and not gate_skipped
                     and not resumed and route != "self_contained"):
-                coarse_evidence = fallback_evidence(
-                    candidates, records, question=question, route=route,
-                    config=config, limit=gate_evidence_limit(config),
-                    verification="coarse_gate")
+                coarse_evidence = _with_verification(
+                    fallback_items, "coarse_gate")
                 if coarse_evidence:
                     coarse_evidence = _attach_source_times(
                         coarse_evidence, records)
@@ -867,7 +976,8 @@ async def run_search(
                                 "deadline": deadline,
                                 "query_images": list(query_images or []),
                             },
-                            missing=gate_missing)
+                            missing=gate_missing,
+                            fallback_path=fallback_path)
                     finally:
                         if owned_index and loop_index is not None:
                             await loop_index.aclose()

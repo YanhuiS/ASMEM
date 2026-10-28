@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from fastapi.responses import JSONResponse
 from .. import multimodal as multimodal_mod
 from ..io import PROJECT_ROOT
 from ..log import Logger
+from ..search import evidence as search_evidence
 from ..search import runner
 from . import store as store_mod
 from .models import (AddRequest, AddResponse, MemoryItem, SearchRequest,
@@ -50,8 +52,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Whole-search wall-clock budget; the runner stops the agent and returns
     # the evidence it already has.  0 disables the budget.
     "search_timeout": 300,
-    # Last-resort cap around run_question (0 = search_timeout + 60).
+    # Last-resort cap around the whole search, including semaphore queue time
+    # (0 = search_timeout + 60).
     "search_hard_timeout": 0,
+    # How long a request waits for a search slot before returning the
+    # model-free fallback.  0 = wait indefinitely (bounded by the hard cap).
+    "search_queue_timeout": 60,
+    # Hard-timeout / queue-timeout fallback.  The search writes a coarse
+    # shortlist to this path before its first model call; the API returns it
+    # if the run is cancelled.  If the file is empty, a BM25-only pass runs.
+    "fallback_enabled": True,
+    "fallback_timeout": 20,
+    "fallback_concurrency": 8,
+    "fallback_evidence_limit": 12,
+    "fallback_keep_files": False,
     # How long a shutdown waits for running searches to finish.
     "shutdown_timeout": 20,
     # /health aggregates per-user meta/memory line counts no more often.
@@ -59,6 +73,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Enforced only when non-empty; otherwise the protocol stays open.
     "api_key": "",
 }
+
+
+class SearchQueueTimeout(asyncio.TimeoutError):
+    """No search slot became available within ``search_queue_timeout``."""
 
 
 def load_config(path: Path | str | None = None) -> dict[str, Any]:
@@ -193,6 +211,16 @@ class ApiState:
             self.search_timeout + 60.0 if self.search_timeout > 0 else 0.0)
         self.shutdown_timeout = max(0.0, float(config.get("shutdown_timeout", 20) or 0))
         self.health_stats_ttl = max(0.0, float(config.get("health_stats_ttl", 10) or 0))
+        self.queue_timeout = max(
+            0.0, float(config.get("search_queue_timeout", 60) or 0))
+        self.fallback_enabled = bool(config.get("fallback_enabled", True))
+        self.fallback_timeout = max(
+            0.0, float(config.get("fallback_timeout", 20) or 0))
+        self.fallback_concurrency = max(
+            1, int(config.get("fallback_concurrency", 8) or 8))
+        self.fallback_sem = asyncio.Semaphore(self.fallback_concurrency)
+        self.fallback_keep_files = bool(
+            config.get("fallback_keep_files", False))
         self.started_at = time.time()
         self.accepting = True
         self.inflight = 0
@@ -235,12 +263,14 @@ class ApiState:
         return dict(snapshot)
 
     # -- request lifecycle --------------------------------------------------
-    async def run_tracked(self, coro: Any) -> Any:
-        """Run ``coro`` so a client disconnect does not cancel the search.
+    async def run_tracked(self, coro: Any, *, keep_alive: bool = True) -> Any:
+        """Run ``coro``, optionally surviving a client disconnect.
 
-        The inner task keeps running (and writes ``summary.json``), so the
-        platform's retry with the same ``request_id`` hits the cached result
-        instead of paying for a second agent run.
+        ``request_id`` retries benefit from keeping the run alive (it can
+        finish and hit the cache).  A request without ``request_id`` cannot be
+        reused by anyone: keeping it alive after the client goes away only
+        holds a ``search_sem`` slot, which is what turned a slow endpoint into
+        a queue of zombie searches.
         """
         self.inflight += 1
         task = asyncio.create_task(coro)
@@ -249,14 +279,17 @@ class ApiState:
         def _done(finished: asyncio.Task[Any]) -> None:
             self.tasks.discard(finished)
             self.inflight = max(0, self.inflight - 1)
-            if not finished.cancelled():
-                exc = finished.exception()
-                if exc is not None:
-                    self.note_error(
-                        f"background search failed: {type(exc).__name__}: {exc}")
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            # A hard timeout is handled by the route (it returns the coarse
+            # fallback); do not record it as a background crash.
+            if exc is not None and not isinstance(exc, asyncio.TimeoutError):
+                self.note_error(
+                    f"background search failed: {type(exc).__name__}: {exc}")
 
         task.add_done_callback(_done)
-        return await asyncio.shield(task)
+        return await (asyncio.shield(task) if keep_alive else task)
 
     async def drain(self) -> None:
         deadline = time.monotonic() + self.shutdown_timeout
@@ -420,61 +453,156 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 return SearchResponse(data=[])
 
         request_id = (request.request_id or "").strip()
+        limit = (request.top_k if request.top_k is not None
+                 else int(state.config.get("top_k", 100)))
+
+        # The search writes a model-free coarse shortlist here before its
+        # first gate/loop call.  On a hard timeout the route returns that
+        # shortlist instead of ``data: []``.  A unique path keeps concurrent
+        # requests and retries isolated.
+        fallback_path: Path | None = None
+        if state.fallback_enabled:
+            try:
+                store.runs_path.mkdir(parents=True, exist_ok=True)
+                fallback_path = (
+                    store.runs_path / f".fallback_{uuid.uuid4().hex}.jsonl")
+            except OSError as exc:
+                state.log.warn(
+                    f"fallback file unavailable user={request.user_id}: "
+                    f"{type(exc).__name__}: {exc}")
 
         async def _run_search() -> dict[str, Any]:
-            async with state.search_sem:
-                coro = runner.run_question(
+            acquired = False
+            try:
+                if state.queue_timeout > 0:
+                    await asyncio.wait_for(
+                        state.search_sem.acquire(), timeout=state.queue_timeout)
+                else:
+                    await state.search_sem.acquire()
+                acquired = True
+                return await runner.run_question(
                     memory_path=store.memory_path, question=query,
                     config=state.config, run_root=store.runs_path, log=state.log,
                     options=options, cache_dir=store.cache_dir,
                     shared_dir=store.shared_dir,
                     request_id=request_id, user_id=request.user_id,
-                    query_images=query_images)
-                if state.hard_timeout <= 0:
-                    return await coro
-                return await asyncio.wait_for(coro, timeout=state.hard_timeout)
+                    query_images=query_images, fallback_path=fallback_path)
+            except asyncio.TimeoutError as exc:
+                if not acquired:
+                    raise SearchQueueTimeout(
+                        f"no search slot within {state.queue_timeout:.0f}s")
+                raise
+            finally:
+                if acquired:
+                    state.search_sem.release()
+
+        async def _bounded_search() -> dict[str, Any]:
+            # The hard cap covers queue wait as well as the run itself.
+            if state.hard_timeout <= 0:
+                return await _run_search()
+            return await asyncio.wait_for(
+                _run_search(), timeout=state.hard_timeout)
+
+        async def _fallback_response(reason: str,
+                                     *, note_error: bool = False) -> SearchResponse:
+            items: list[dict[str, Any]] = []
+            if fallback_path is not None:
+                try:
+                    items = search_evidence.read_file(fallback_path)
+                except Exception as exc:  # noqa: BLE001
+                    state.log.warn(
+                        f"fallback read failed user={request.user_id}: "
+                        f"{type(exc).__name__}: {exc}")
+            if not items and state.fallback_enabled:
+                try:
+                    async with state.fallback_sem:
+                        coro = runner.quick_coarse_fallback(
+                            memory_path=store.memory_path, question=query,
+                            config=state.config, options=options,
+                            cache_dir=store.cache_dir,
+                            limit=int(state.config.get(
+                                "fallback_evidence_limit", 12) or 12),
+                            timeout=state.fallback_timeout)
+                        items = (await asyncio.wait_for(
+                            coro, timeout=state.fallback_timeout + 5.0)
+                            if state.fallback_timeout > 0 else await coro)
+                except Exception as exc:  # noqa: BLE001
+                    state.log.warn(
+                        f"coarse fallback failed user={request.user_id}: "
+                        f"{type(exc).__name__}: {exc}")
+            try:
+                raw_records = await asyncio.to_thread(store.records)
+            except Exception:  # noqa: BLE001
+                raw_records = []
+            records = {str(item.get("id")): item for item in raw_records}
+            try:
+                data = build_search_items(
+                    items, records, multimodal=multimodal_query, top_k=limit,
+                    media_root=store.images_dir, config=state.config)
+            except Exception as exc:  # noqa: BLE001 - fallback must not 5xx
+                state.log.warn(
+                    f"fallback build failed user={request.user_id}: "
+                    f"{type(exc).__name__}: {exc}")
+                data = []
+            message = (f"search {reason} user={request.user_id} "
+                       f"request={request_id or '-'} fallback={len(data)}")
+            if note_error:
+                state.note_error(message)
+                state.log.error(message)
+            else:
+                state.log.warn(message)
+            return SearchResponse(data=data)
 
         started = time.perf_counter()
         try:
-            result = await state.run_tracked(_run_search())
-        except asyncio.CancelledError:
-            # The client went away.  The inner task is shielded and keeps
-            # running; a retry with the same request_id gets its cached
-            # result instead of starting over.
-            state.log.warn(
-                f"search client disconnected user={request.user_id} "
-                f"request={request_id or '-'}; keeping the run alive")
-            raise
-        except asyncio.TimeoutError:
-            message = ("search hard timeout "
-                       f"({state.hard_timeout:.0f}s) user={request.user_id}")
-            state.note_error(message)
-            state.log.error(message)
-            return SearchResponse(data=[])
-        except Exception as exc:  # noqa: BLE001 - protocol never sees a 5xx
-            message = (f"search failed user={request.user_id} "
-                       f"request={request_id or '-'}: {type(exc).__name__}: {exc}")
-            state.note_error(message)
-            state.log.error(message)
-            return SearchResponse(data=[])
+            try:
+                result = await state.run_tracked(
+                    _bounded_search(), keep_alive=bool(request_id))
+            except asyncio.CancelledError:
+                # The client went away.  With a request_id the inner task is
+                # shielded so a retry can reuse it; without one it is
+                # cancelled, which releases its search_sem slot.
+                state.log.warn(
+                    f"search client disconnected user={request.user_id} "
+                    f"request={request_id or '-'}; "
+                    f"{'keeping the run alive' if request_id else 'cancelled'}")
+                raise
+            except SearchQueueTimeout:
+                return await _fallback_response("queue timeout")
+            except asyncio.TimeoutError:
+                return await _fallback_response("hard timeout", note_error=True)
+            except Exception as exc:  # noqa: BLE001 - protocol never sees a 5xx
+                state.note_error(
+                    f"search failed user={request.user_id} "
+                    f"request={request_id or '-'}: "
+                    f"{type(exc).__name__}: {exc}")
+                return await _fallback_response("failure")
 
-        summary = result.get("summary") or {}
-        state.log.info(
-            f"search user={request.user_id} request={request_id or '-'} "
-            f"evidence={len(result.get('evidence') or [])} "
-            f"degraded={bool(summary.get('degraded'))} "
-            f"cached={bool(result.get('cached'))} "
-            f"stop={summary.get('stop_reason') or '-'} "
-            f"seconds={time.perf_counter() - started:.2f}")
+            summary = result.get("summary") or {}
+            state.log.info(
+                f"search user={request.user_id} request={request_id or '-'} "
+                f"evidence={len(result.get('evidence') or [])} "
+                f"degraded={bool(summary.get('degraded'))} "
+                f"cached={bool(result.get('cached'))} "
+                f"stop={summary.get('stop_reason') or '-'} "
+                f"seconds={time.perf_counter() - started:.2f}")
 
-        records = {str(item.get("id")): item for item in store.records()}
-        limit = (request.top_k if request.top_k is not None
-                 else int(state.config.get("top_k", 100)))
-        data = build_search_items(
-            result.get("evidence") or [], records,
-            multimodal=multimodal_query, top_k=limit,
-            media_root=store.images_dir, config=state.config)
-        return SearchResponse(data=data)
+            try:
+                raw_records = await asyncio.to_thread(store.records)
+            except Exception:  # noqa: BLE001 - response must not 5xx
+                raw_records = []
+            records = {str(item.get("id")): item for item in raw_records}
+            data = build_search_items(
+                result.get("evidence") or [], records,
+                multimodal=multimodal_query, top_k=limit,
+                media_root=store.images_dir, config=state.config)
+            return SearchResponse(data=data)
+        finally:
+            if fallback_path is not None and not state.fallback_keep_files:
+                try:
+                    fallback_path.unlink()
+                except OSError:
+                    pass
 
     return app
 

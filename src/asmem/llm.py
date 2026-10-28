@@ -177,6 +177,64 @@ class ContextOverflow(ModelUnavailable):
     """
 
 
+class EndpointBreaker:
+    """Process-wide circuit breaker for one ``(base_url, model)`` endpoint.
+
+    The per-run breaker in :class:`asmem.search.model.ModelRunner` protects one
+    search from a dead endpoint, but every new HTTP request constructs a new
+    runner, so an outage still causes every request to pay the same timeout.
+    This shared breaker opens after ``threshold`` failures and lets all new
+    searches fail fast into the deterministic coarse fallback until the
+    cooldown expires.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict[str, dict[str, float]] = {}
+
+    def allow(self, key: str, threshold: int, cooldown: float) -> tuple[bool, str]:
+        if threshold <= 0:
+            return True, ""
+        state = self._state.get(key)
+        if not state:
+            return True, ""
+        opened = float(state.get("opened_at") or 0.0)
+        if not opened:
+            return True, ""
+        elapsed = time.monotonic() - opened
+        if elapsed >= cooldown:
+            # Cooldown elapsed: allow one probe.  Keep the failure count at
+            # the threshold so a failed probe re-opens immediately; a success
+            # resets it in ``success``.
+            state["opened_at"] = 0.0
+            return True, ""
+        return False, (
+            f"global model circuit open for {cooldown - elapsed:.0f}s "
+            f"(endpoint {key})")
+
+    def failure(self, key: str, threshold: int) -> None:
+        if threshold <= 0:
+            return
+        state = self._state.setdefault(
+            key, {"failures": 0.0, "opened_at": 0.0})
+        state["failures"] = float(state.get("failures") or 0.0) + 1.0
+        if state["failures"] >= threshold:
+            state["opened_at"] = time.monotonic()
+
+    def success(self, key: str) -> None:
+        state = self._state.get(key)
+        if state is not None:
+            state["failures"] = 0.0
+            state["opened_at"] = 0.0
+
+    def reset(self) -> None:
+        self._state.clear()
+
+
+#: Shared by every ModelRunner in this process.  Opt-in via
+#: ``llm_global_breaker_failures > 0``.
+GLOBAL_BREAKER = EndpointBreaker()
+
+
 def merge_call_config(config: dict[str, Any]) -> dict[str, Any]:
     """把调用方的配置叠到默认值上，只保留 ``CALL_KEYS``。
 

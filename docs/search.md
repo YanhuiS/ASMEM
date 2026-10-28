@@ -207,8 +207,21 @@ multimodal:
   return_images: true
   max_response_images: 8
 ```
+### 4.5 超时、队列与 fallback
 
-### 4.5 上下文与预算
+- 硬超时从**获取 `search_sem` 之前**开始计时；`search_queue_timeout` 内拿不到 slot 就
+  走 fallback，避免排队把请求拖到 600s。
+- `run_search` 在第一个 gate/loop 模型调用前，把 top coarse 证据写入 API 提供的
+  fallback 文件；硬超时/异常时 API 返回这份证据，而不是 `data: []`。
+- fallback 文件为空（例如 coarse 也超时）时，`quick_coarse_fallback` 关闭 dense，跑一次
+  BM25-only 粗筛，不调用任何模型。
+- 只有带 `request_id` 的请求在客户端断开后继续运行；无 `request_id` 的请求会被取消，
+  释放 `search_sem`。
+- `llm_global_breaker_failures` 控制进程级 endpoint 熔断；打开后新搜索快速降级。
+- `model_input_token_cap` 做 prompt 预检；`context_overflow_retries` 在 400
+  context overflow 时把 prompt 缩小后重试。
+
+### 4.6 上下文与预算
 
 - 每轮只渲染 top 16 证据 + top 5 搜索结果；
 - 单条 note `loop_note_chars` 上限；
@@ -294,6 +307,18 @@ final_evidence_chars: 40000
 final_item_chars: 4000
 final_claim_cap: 12
 final_agent_cap: 16
+# Timeout / queue / fallback
+search_queue_timeout: 60
+fallback_enabled: true
+fallback_timeout: 20
+fallback_evidence_limit: 12
+llm_global_breaker_failures: 8
+# Context protection
+model_input_token_cap: 24000
+model_output_reserve_tokens: 4096
+context_overflow_retries: 1
+verifier_max_output_tokens: 2048
+postagent_max_output_tokens: 4096
 auto_capture_hits: true
 auto_capture_limit: 2
 auto_capture_total: 6

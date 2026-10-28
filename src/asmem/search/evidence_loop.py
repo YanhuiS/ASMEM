@@ -317,6 +317,7 @@ async def run_evidence_loop(
     call_model: ModelCall,
     config: dict[str, Any],
     missing: Sequence[str] | None = None,
+    fallback_path: Path | None = None,
 ) -> EvidenceLoopResult:
     """Run the bounded search -> note -> finish loop over the coarse index."""
     path = workspace / EVIDENCE_NAME
@@ -344,11 +345,21 @@ async def run_evidence_loop(
     def deadline_hit() -> bool:
         return deadline is not None and time.monotonic() >= float(deadline)
 
+    def save_fallback() -> None:
+        """Keep the API's hard-timeout copy in sync with notes so far."""
+        if fallback_path is None:
+            return
+        try:
+            evidence.write_file(fallback_path, evidence.read_file(path))
+        except OSError:
+            pass
+
     for step in range(1, max_steps + 1):
         if deadline_hit():
             result.stop_reason = "deadline"
             break
         result.steps = step
+        save_fallback()
         items = evidence.read_file(path)
         prompt = _prompt(
             question, result.missing, items, last_hits, seen_queries,
@@ -456,6 +467,7 @@ async def run_evidence_loop(
                 "saved": saved,
             })
 
+    save_fallback()
     result.evidence = evidence.read_file(path)
     result.stats = {
         "mode": "evidence_loop",

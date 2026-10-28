@@ -41,6 +41,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # cannot outlive it.
     "search_timeout": 300,
     "search_hard_timeout": 360,
+    # Queue and fallback policy.  The hard timeout covers semaphore wait; a
+    # request that cannot get a slot within ``search_queue_timeout`` returns
+    # the model-free coarse fallback instead of queueing for the whole budget.
+    "search_queue_timeout": 60,
+    "fallback_enabled": True,
+    "fallback_timeout": 20,
+    "fallback_concurrency": 8,
+    "fallback_evidence_limit": 12,
+    "fallback_keep_files": False,
+    # A process-wide endpoint breaker (0 disables).  Unlike the per-run
+    # breaker, this stops every new search from retrying a dead endpoint.
+    "llm_global_breaker_failures": 0,
+    "llm_global_breaker_cooldown": 30,
+    # Preflight cap for every model prompt and context-overflow recovery.
+    # 0 disables the preflight; the API config enables 24000.
+    "model_input_token_cap": 0,
+    "model_output_reserve_tokens": 4096,
+    "context_overflow_retries": 1,
+    # Output caps by role: gate/verifier replies are short JSON, the postagent
+    # needs room for tool calls/claims.
+    "verifier_max_output_tokens": 2048,
+    "postagent_max_output_tokens": 4096,
     # Refuse a reused coarse source when the deterministic retrieval config
     # fingerprint differs (candidate-id validation is always applied).
     "reuse_coarse_strict": True,
