@@ -14,12 +14,12 @@ the same text produce the same terms on every machine.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Iterable
 
 _WORD_OR_CJK = re.compile(
     r"[A-Za-z0-9_]+|[㐀-䶿一-鿿豈-﫿]+"
 )
-_CJK_CHAR = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 _QUOTED = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{2,80})[\"“”'‘’]")
 _CAPITAL = re.compile(r"\b(?:[A-Z][A-Za-z0-9_.\-]*)(?:\s+[A-Z][A-Za-z0-9_.\-]*){1,4}\b")
 _NUMBER = re.compile(r"\b\d+(?:[.,:/\-]\d+)*\b")
@@ -57,9 +57,8 @@ def _post_stem(base: str) -> str:
     return base
 
 
-def _stem(word: str) -> str:
-    if len(word) <= 3 or not word.isascii():
-        return word
+@lru_cache(maxsize=1 << 16)
+def _stem_cached(word: str) -> str:
     if word.endswith("sses"):
         return word[:-2]
     if word.endswith("ies") and len(word) > 4:
@@ -79,12 +78,25 @@ def _stem(word: str) -> str:
     return word
 
 
+def _stem(word: str) -> str:
+    # Short and non-ASCII tokens skip the suffix rules; caching those would
+    # only waste memory (CJK unigrams/bigrams are unbounded).  Repeating
+    # vocabulary in a large memory is what the cache is for.
+    if len(word) <= 3 or not word.isascii():
+        return word
+    return _stem_cached(word)
+
+
 def tokenize(text: str) -> list[str]:
     """Return deterministic terms; duplicates are preserved for BM25 tf."""
     out: list[str] = []
-    for match in _WORD_OR_CJK.finditer(text or ""):
-        token = match.group(0)
-        if _CJK_CHAR.match(token):
+    # findall() returns the matched strings directly; finditer() + Match.group()
+    # allocates a Match object per token, which dominates on the hot path.
+    for token in _WORD_OR_CJK.findall(text or ""):
+        # _WORD_OR_CJK only matches ASCII word runs or CJK runs, so a
+        # non-ASCII token is exactly a CJK run.  isascii() is a C-level check
+        # and avoids a regex match per token on this hot path.
+        if not token.isascii():
             chars = list(token)
             out.extend(chars)
             out.extend(chars[i] + chars[i + 1] for i in range(len(chars) - 1))
@@ -130,7 +142,10 @@ def normalize_text(text: str) -> str:
 
 
 def jaccard(left: Iterable[str], right: Iterable[str]) -> float:
-    a, b = set(left), set(right)
+    # Already-materialized sets (the common case in the dedup loop) are used
+    # as-is; set operations do not mutate their operands.
+    a = left if isinstance(left, (set, frozenset)) else set(left)
+    b = right if isinstance(right, (set, frozenset)) else set(right)
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
