@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Global ``coarse`` command (put this directory on PATH).
+
+    coarse --query "where did Alice move" --top 8
+    coarse --query "..." --out inputs/coarse_run
+
+The workspace shell prefix adds ``<repo>/scripts`` to PATH, so the postagent
+can call ``coarse`` without a per-run copy.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from asmem.search.coarse_cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

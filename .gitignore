@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data, benchmark runs, caches, archives
+data/
+data_backup/
+output/
+reference/
+archive.tar
+
+# Generated/local config overrides
+*.used.yaml
+*.local.yaml
+
+# Comparison-only configs/scripts (kept locally, not part of the core commit)
+configs/ablations/
+scripts/ablations/
+
+# Historical design drafts
+docs/archive/

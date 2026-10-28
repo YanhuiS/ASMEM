@@ -1,0 +1,25 @@
+[project]
+name = "asmem"
+version = "0.1.0"
+description = "ASMEM: a minimal code-agent memory system"
+readme = "README.md"
+authors = [
+    { name = "xrnve", email = "3296986532@qq.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "pyyaml",
+    "tqdm",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.scripts]
+asmem = "asmem:main"
+coarse = "asmem.search.coarse_cli:main"
+asmem-coarse = "asmem.search.coarse_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
