@@ -525,7 +525,16 @@ def _content_text(content: Any) -> str:
                 ref = part.get("image_url") or part.get("url") or part.get("path")
                 if isinstance(ref, dict):
                     ref = ref.get("url")
-                parts.append(f"[image: {ref}]" if ref else "[image]")
+                if isinstance(ref, str) and ref.startswith("data:"):
+                    # Inline base64 must never enter memory text: one image is
+                    # up to 10 MiB and would poison BM25, evidence and prompts.
+                    header, _, payload = ref.partition(",")
+                    mime = (header[5:].split(";", 1)[0].strip()
+                            if header.startswith("data:") else "")
+                    size = (len(payload) * 3) // 4 if payload else 0
+                    parts.append(f"[image: {mime or 'inline'}, ~{size} bytes]")
+                else:
+                    parts.append(f"[image: {ref}]" if ref else "[image]")
         return "\n".join(part for part in parts if part)
     return str(content) if content is not None else ""
 

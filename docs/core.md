@@ -10,14 +10,16 @@
 ASMEM 是一个**长期记忆检索后端**，不是端到端问答模型：
 
 - `POST /add`：把对话、长文档、表格、三元组、agent 轨迹归一化成同一种记录，落成
-  `memory.jsonl`。**不调用生成式模型**，不摘要、不抽 atom、不改写事实。
+  `memory.jsonl`。**不摘要、不抽 atom、不改写事实**。文本/代码赛道不调用生成式模型；
+  多模态赛道仅在图片本身没有 caption/伴随文本时，可选调用一次 vision caption（见 3.5）。
 - `POST /search`：先做完全确定性的多通道粗筛，再由 verifier 决定两条路：
   **通过 → 直接用粗筛证据 answer；不通过 → postagent loop 补证据**。
   它不生成最终答案。
 
 三条边界：
 
-1. **Add 只做格式层。** 原始记录始终可 grep、可引用。
+1. **Add 只做格式层。** 原始记录始终可 grep、可引用；多模态图片只派生 caption 与
+   `[image: <id>]` 引用，不派生事实。
 2. **粗筛不调用 LLM。** 同一份 memory、同一个 query 永远得到同一批候选；dense 可选。
 3. **postagent 只做证据，不做答案。** 它留下的 `evidence.jsonl` 就是下游 answer
    看到的全部证据。
@@ -139,7 +141,41 @@ QUERIES ALREADY RUN
   normalized text 合并去重；
 - 最多 `loop_max_steps: 3`；加 verifier 1 次，仍低于 6。
 
-### 3.5 后处理：answer 看到的才是最终证据
+### 3.5 多模态：caption 检索，不做 image embedding
+
+多模态赛道只在**报文形态**上和文本赛道不同：`messages[].content` 与 `query` 是有序的
+`ContentPart[]`。ASMEM 不训练也不调用图像 encoder，检索仍然只认文本：
+
+```text
+ContentPart[]（text + inline base64 image）
+  │
+  ├─ Add：图片解码 → <user>/images/<sha256>.<ext>（内容寻址）
+  │       caption = 显式 caption / 同条 text / 可选 vision caption（按图 hash 缓存）
+  │       memory.text = 原文 + "[caption] ..." + "[image: <short id>]"
+  │       meta.media = {id, sha256, mime, bytes, path}
+  ▼
+文本 memory（BM25 / dense 文本向量 / exact / time / state 全部照常）
+  │
+  ├─ Search：query 里的图片同样先 caption，再进入粗筛
+  │       gate 最多看 1 张 query 图；memory 图不进 postagent
+  ▼
+build_search_items：text ContentPart 在前，命中的 memory 图按预算追加
+```
+
+关键约束：
+
+- **base64 永不进入 memory / evidence / prompt。** 单图最大 10 MiB，整条 Add 30 MiB；
+  memory 只保留短 id 和 caption（默认 ≤300 字符）。
+- **没有 image embedding。** caption 是唯一可检索的图片表示；dense 编码的也是 caption。
+- **postagent 只在必要时看多模态。** 文本 query 完全不附图；多模态 query 只在 gate 和
+  evidence loop 第一轮附 1 张查询图。memory 图不进入内部 agent prompt，而是随 Search
+  响应返回给下游 answer。
+- **响应预算。** Search 返回的图片同样受 10 MiB/图、30 MiB/响应和
+  `max_response_images` 限制；放不下的图直接跳过，不截断响应。
+- caption 端点失败不影响 Add：降级为同条 text / `[image: <id>]`，`/add` 仍返回
+  `success=true`。
+
+### 3.6 后处理：answer 看到的才是最终证据
 
 `postprocess_evidence`：
 
@@ -175,6 +211,14 @@ loop_force_intents: []
 loop_accept_answer_types: []
 gate_check_consistency: true
 pre_audit: false
+multimodal:
+  caption: true
+  caption_query: true
+  max_image_bytes: 10485760
+  max_request_bytes: 31457280
+  max_response_bytes: 31457280
+  max_response_images: 8
+  postagent_images: auto      # auto / never / always
 ```
 
 API 只改 generator/embedding endpoint、`concurrency`、`store_dir` 等部署项；

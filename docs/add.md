@@ -3,7 +3,8 @@
 > 代码：`src/asmem/adapters.py`、`src/asmem/schema.py`、`src/asmem/state.py`、`src/asmem/api/store.py`
 > 入口：`POST /add`、`python -m asmem.add`
 
-Add 是整条流水线里**唯一不调用生成式模型**的写入阶段。它只做四件事：
+文本/代码赛道的 Add 是整条流水线里**唯一不调用生成式模型**的写入阶段；多模态赛道只有在
+图片没有 caption/伴随文本时才可选调用一次 vision caption（§2.4），其余逻辑不变。它只做四件事：
 
 1. 从平台报文里恢复真实结构（说话人、时间、文档、表格、三元组、轨迹）；
 2. 按 token 切分检索单元，保留原始单元的 `parent_id / part / parts`；
@@ -72,8 +73,23 @@ Embedding 是**可选编码器**，不是 Add 的必需步骤。`index_on_add=fa
 ### 2.3 适配层不做的事
 
 - 不改写事实、不摘要、不翻译；
-- 不把图片变成理解结果，只保留引用；
 - 不猜测自然语言中的更新关系；只把显式 `UPDATE:` 变成状态标记。
+
+### 2.4 多模态分支：图片落盘 + caption
+
+文本/代码赛道的 `content` 是字符串；多模态赛道是有序 `ContentPart[]`。多模态分支在
+`api/models.py` 之前发生（`asmem.multimodal.build_content`）：
+
+1. 内联 Base64 按 `data:` 头解码，校验 JPEG/PNG/WebP 与 10 MiB 上限；
+2. 以 SHA-256 内容寻址写入 `<user>/images/<xx>/<sha>.<ext>`，重复图片只占一份；
+3. caption 顺序：part 上的 `caption/alt/description` → 同条 text part → 可选 vision
+   caption（按图 hash 缓存，失败不影响 Add）；
+4. `memory.text` 写入 `[caption] ...` 与 `[image: <16 位 id>]`，**base64 不进入正文**；
+5. `meta.media` 记录 `{id, sha256, mime, bytes, path}`；同一 parent 的所有分片都能拿到
+   这张图，Search 回复时再按预算读回 data URI。
+
+因此 Add 的“不摘要、不改写”边界不变；唯一新增的是把图片变成可检索的 caption 文本。
+`multimodal.caption=false` 时完全退化为“同条 text + 图片 id”，仍然是纯 CPU 写入。
 
 ---
 
@@ -232,6 +248,7 @@ data/asmem/<user>/
   memory.jsonl        # 追加写，统一记录
   state.jsonl         # 派生状态索引
   meta.json           # sessions / applied / pending / counts
+  images/             # 多模态图片资源（内容寻址）+ captions/ 缓存
   index/              # BM25/dense/state 的懒加载产物（可选）
   cache/              # embedding 缓存
   runs/               # search workspace
@@ -245,3 +262,6 @@ data/asmem/<user>/
 - 状态识别只覆盖显式 `UPDATE:` / 三元组；自然语言里的“其实我更喜欢……”不会被自动标成 replace，需要检索阶段判断。
 - 超长表格行/三元组保持原子；如果单行本身超过上下文预算，需要调用方先切分。
 - Add 不建索引；第一次检索会有一次索引构建成本（BM25 是毫秒级，dense 取决于 embedding 服务）。
+- 多模态图片只以 caption 参与检索，不做图像 embedding；caption 端点不可用时收益会下降，
+  但 Add/Search 不会失败。
+- 图片资源只做内容寻址与大小校验，不做裁剪/缩放；超过 10 MiB 的图按协议直接丢弃。

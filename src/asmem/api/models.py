@@ -7,9 +7,10 @@
 
 底层语料是**文本** JSONL（search agent 用 grep 检索、用 ``date -d`` 做时间算术），所以
 多模态在这里被**降级成文本**：文本 part 原样保留，图片 part 变成 ``[image: <ref>]`` 这样的
-可检索、可溯源的文本标记。**本系统不做图像理解** —— 这一点在 README 里明说，避免误判。
+可检索、可溯源的文本标记。内联 base64 只按 MIME/大小记一个摘要，**绝不写进正文**。
 
-归一化只做一件事：把两种形态都变成一个**自足、可 grep** 的字符串；不做任何语义改写。
+完整的多模态分支（图片落盘、caption 生成与返回）在 :mod:`asmem.multimodal`；本模块的
+``normalize_content`` 是无 store 场景下的纯文本兜底。归一化不做任何语义改写。
 """
 
 from __future__ import annotations
@@ -112,6 +113,8 @@ def _part_to_text(part: Any) -> str:
     - ``{"image_url": "..."}`` / ``{"url": "..."}`` 等缺 type 的形态
 
     图片一律降级成 ``[image: <ref>]`` —— 保留引用便于审计与人工核对，但不假装理解它。
+    内联 Base64 **绝不进入正文**：只写 ``[image: <mime>, ~<bytes> bytes]``，否则一条图片
+    就能把 memory、BM25 和 prompt 撑爆（多模态赛道的 base64 单图可达 10 MiB）。
     """
     if isinstance(part, str):
         return part
@@ -145,8 +148,22 @@ def _part_to_text(part: Any) -> str:
     if not ref and isinstance(part.get("data"), str):
         ref = f"<{len(part['data'])} bytes>"   # base64：不给全文（会污染语料），只记规模
     if ptype.startswith("image") or ref:
-        return f"[image: {ref}]" if ref else "[image]"
+        return _image_ref_text(ref)
     return ""
+
+
+def _image_ref_text(ref: str) -> str:
+    """Short, audit-safe reference; inline base64 is summarized, never copied."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return "[image]"
+    if ref.startswith("data:"):
+        header, _, payload = ref.partition(",")
+        mime = header[5:].split(";", 1)[0].strip() if header.startswith("data:") else ""
+        size = (len(payload) * 3) // 4 if payload else 0
+        suffix = f", ~{size} bytes" if size else ""
+        return f"[image: {mime or 'inline'}{suffix}]"
+    return f"[image: {ref}]"
 
 
 def normalize_content(content: Any) -> str:

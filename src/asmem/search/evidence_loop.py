@@ -358,10 +358,21 @@ async def run_evidence_loop(
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": prompt},
         ]
+        multimodal_cfg = (config.get("multimodal")
+                          if isinstance(config.get("multimodal"), dict) else {})
+        image_mode = str(multimodal_cfg.get("postagent_images") or "auto").lower()
+        query_images = config.get("query_images") or []
+        if (query_images and image_mode != "never"
+                and (step == 1 or image_mode == "always")):
+            # "Only when necessary": the query is multimodal, so one query
+            # image is attached to the first turn (or every turn in "always").
+            # Memory images never enter this prompt; captions are enough.
+            messages = llm.attach_images(messages, list(query_images), max_images=1)
         if agent_context > 0:
             messages = llm.fit_messages(
                 messages, agent_context, reserve_tokens=reserve)
-        result.history.extend(messages)
+        # The call may carry the query image; the saved transcript must not.
+        result.history.extend(llm.strip_images(messages))
         try:
             reply = await call_model(messages, None)
         except Exception as exc:  # noqa: BLE001 - keep the evidence we have

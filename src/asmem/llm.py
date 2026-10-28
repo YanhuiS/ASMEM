@@ -205,6 +205,129 @@ def estimate_tokens(text: str) -> int:
     return int(ascii_chars / 3.6 + other_chars / 1.1) + 1
 
 
+#: Conservative token charge for one inline image part.  A vision endpoint
+#: bills by pixels, not by the base64 string; a fixed charge keeps the
+#: preflight budget honest without ever styling the 10 MiB URI as text.
+IMAGE_TOKEN_COST = 1024
+
+
+def content_text(content: Any) -> str:
+    """Prompt-safe text for a ``str`` or ordered ``ContentPart[]``.
+
+    Image parts become ``[image]``.  The base64 payload is never included, so
+    logging or estimating a multimodal message cannot accidentally copy 10 MiB
+    into a prompt.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                parts.append(str(part))
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            elif "image_url" in part or str(part.get("type") or "").startswith("image"):
+                parts.append("[image]")
+        return "\n".join(item for item in parts if item)
+    return str(content or "")
+
+
+def content_image_count(content: Any) -> int:
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for part in content
+               if isinstance(part, dict)
+               and ("image_url" in part
+                    or str(part.get("type") or "").startswith("image")))
+
+
+def estimate_content_tokens(content: Any) -> int:
+    """Token estimate that treats each image as a fixed, bounded cost."""
+    if not isinstance(content, list):
+        return estimate_tokens(str(content or ""))
+    total = 0
+    for part in content:
+        if isinstance(part, dict) and (
+                "image_url" in part or str(part.get("type") or "").startswith("image")):
+            total += IMAGE_TOKEN_COST
+        elif isinstance(part, dict):
+            total += estimate_tokens(str(part.get("text") or ""))
+        else:
+            total += estimate_tokens(str(part or ""))
+    return total
+
+
+def attach_images(messages: list[dict[str, Any]], images: list[str] | None,
+                  *, max_images: int = 1,
+                  max_bytes: int = 10 * 1024 * 1024) -> list[dict[str, Any]]:
+    """Append at most ``max_images`` inline images to the last user message.
+
+    Used only for a multimodal query, and only on the bounded gate/first loop
+    turn.  Memory images are never attached here: they reach the answer through
+    the Search response, not through an internal agent prompt.
+    """
+    if not messages or not images or max_images <= 0:
+        return messages
+    parts: list[dict[str, Any]] = []
+    # Base64 expands by 4/3; the header is negligible.
+    char_limit = max(0, int(max_bytes)) * 4 // 3 + 1024
+    for image in images:
+        if len(parts) >= max_images:
+            break
+        if not isinstance(image, str) or not image.startswith("data:"):
+            continue
+        if len(image) > char_limit:
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": image}})
+    if not parts:
+        return messages
+    out = [dict(message) for message in messages]
+    index = next((position for position in range(len(out) - 1, -1, -1)
+                  if out[position].get("role") == "user"), None)
+    if index is None:
+        return messages
+    content = out[index].get("content")
+    if isinstance(content, list):
+        out[index]["content"] = list(content) + parts
+    elif isinstance(content, str):
+        out[index]["content"] = [{"type": "text", "text": content}] + parts
+    else:
+        out[index]["content"] = [{"type": "text", "text": str(content or "")}] + parts
+    return out
+
+
+def strip_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A transcript-safe copy: image parts become ``[image]``.
+
+    Model calls may carry one query image, but ``agent_history.jsonl`` and the
+    run summary must stay small and must never persist a 10 MiB data URI.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(dict(message))
+            continue
+        parts: list[Any] = []
+        for part in content:
+            if (isinstance(part, dict)
+                    and ("image_url" in part
+                         or str(part.get("type") or "").startswith("image"))):
+                parts.append({"type": "text", "text": "[image]"})
+            else:
+                parts.append(part)
+        item = dict(message)
+        item["content"] = parts
+        out.append(item)
+    return out
+
+
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     if max_tokens <= 0:
         return ""
@@ -220,6 +343,19 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:low].rstrip() + "\n\n[... truncated to fit the context window ...]"
 
 
+def _truncate_content(content: Any, max_tokens: int) -> Any:
+    """Truncate a message body; an over-budget image list becomes text."""
+    if isinstance(content, str):
+        return _truncate_to_tokens(content, max_tokens)
+    return _truncate_to_tokens(content_text(content), max_tokens)
+
+
+def _content_size(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    return len(content_text(content)) + 1024 * content_image_count(content)
+
+
 def fit_messages(messages: list[dict[str, Any]], max_input_tokens: int,
                  *, reserve_tokens: int = 0) -> list[dict[str, Any]]:
     """Shrink a prompt so ``input + reserve`` fits ``max_input_tokens``.
@@ -229,27 +365,30 @@ def fit_messages(messages: list[dict[str, Any]], max_input_tokens: int,
     judge prompts put the evidence last, so this drops the least relevant
     records first.  This is a preflight guard: it prevents a 400
     ``context_length_exceeded`` instead of retrying one.
+
+    ``ContentPart[]`` content is measured with a fixed per-image charge and,
+    when it must shrink, is replaced by its text parts (never by the base64).
     """
     budget = max(512, int(max_input_tokens) - int(reserve_tokens))
     out = [dict(message) for message in messages]
-    total = sum(estimate_tokens(str(item.get("content") or "")) for item in out)
+    total = sum(estimate_content_tokens(item.get("content")) for item in out)
     if total <= budget:
         return out
     order = sorted(
         (index for index, item in enumerate(out) if item.get("role") != "system"),
-        key=lambda index: len(str(out[index].get("content") or "")),
+        key=lambda index: _content_size(out[index].get("content")),
         reverse=True,
     )
     for index in order:
         others = sum(
-            estimate_tokens(str(item.get("content") or ""))
+            estimate_content_tokens(item.get("content"))
             for position, item in enumerate(out) if position != index
         )
         allowed = max(64, budget - others)
-        content = str(out[index].get("content") or "")
-        if estimate_tokens(content) > allowed:
-            out[index]["content"] = _truncate_to_tokens(content, allowed)
-        total = sum(estimate_tokens(str(item.get("content") or "")) for item in out)
+        content = out[index].get("content")
+        if estimate_content_tokens(content) > allowed:
+            out[index]["content"] = _truncate_content(content, allowed)
+        total = sum(estimate_content_tokens(item.get("content")) for item in out)
         if total <= budget:
             break
     return out

@@ -183,7 +183,32 @@ QUERIES ALREADY RUN
   `postprocess_evidence` / `fit_evidence`，按 source 和 normalized text 合并去重；
 - 粗筛 seed 永远保留；notes 只追加。
 
-### 4.4 上下文与预算
+### 4.4 多模态 query 与 postagent
+
+Search 的 `query` 是多模态 `ContentPart[]` 时：
+
+1. `multimodal.query_content` 把 query 文本与图片 caption 合成检索文本；图片本身不进入
+   BM25/dense，也不做 image embedding；
+2. 最多保留 1 张合法 data URI（`max_query_images`），只用于 **gate** 和 **evidence loop
+   第一轮** 的模型调用；文本 query 永远不附图；
+3. memory 里的图片**不进入** postagent prompt —— postagent 只看 caption。命中的 memory
+   图由 `api.server.build_search_items` 在响应里返回，受 10 MiB/图、30 MiB/响应和
+   `max_response_images` 限制；
+4. `agent_history.jsonl` 持久化前会把图片 part 替换成 `[image]`，避免把 base64 写进运行
+   记录。
+
+相关配置：
+
+```yaml
+multimodal:
+  caption_query: true        # query 图也生成 caption
+  max_query_images: 1
+  postagent_images: auto     # auto: gate + loop 第一轮；never / always
+  return_images: true
+  max_response_images: 8
+```
+
+### 4.5 上下文与预算
 
 - 每轮只渲染 top 16 证据 + top 5 搜索结果；
 - 单条 note `loop_note_chars` 上限；

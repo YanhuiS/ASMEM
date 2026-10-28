@@ -648,6 +648,7 @@ async def gate_verify(
     *,
     max_context_tokens: int = 0,
     check_consistency: bool = False,
+    images: Sequence[str] | None = None,
 ) -> Verdict:
     """Permissive coarse-sufficiency gate.
 
@@ -662,6 +663,10 @@ async def gate_verify(
         {"role": "system", "content": prompts.GATE},
         {"role": "user", "content": prompts.verifier_prompt(question, records)},
     ]
+    if images:
+        # One query image, one bounded gate call.  With a text-only question
+        # this branch is never reached; memory images are never attached.
+        messages = llm.attach_images(messages, list(images), max_images=1)
     if max_context_tokens > 0:
         messages = llm.fit_messages(
             messages, max_context_tokens, reserve_tokens=1024)

@@ -30,6 +30,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .. import multimodal as multimodal_mod
 from ..io import PROJECT_ROOT
 from ..log import Logger
 from ..search import runner
@@ -80,6 +81,8 @@ def build_search_items(
     *,
     multimodal: bool = False,
     top_k: int = 100,
+    media_root: Path | str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> list[MemoryItem]:
     """Map runner evidence to the competition's Search response contract.
 
@@ -87,16 +90,40 @@ def build_search_items(
 
     * ``content`` is non-empty (string for text/code, text ``ContentPart[]``
       for multimodal);
+    * multimodal results may append stored image parts after the text, within
+      the protocol's per-image (10 MiB) and per-response (30 MiB) budgets;
     * ``id`` is unique and stable (source record id + content hash, or
       ``mem_<hash>`` for query-derived evidence);
     * ``score`` is strictly non-increasing along the returned rank order, as
       the contract requires "higher score == more relevant";
     * optional fields are left as ``None`` so the route's
       ``response_model_exclude_none`` omits them instead of sending ``null``.
+
+    Images are only attached when the caller supplies ``media_root``; memory
+    text never contains base64, so a text/code request is unaffected.
     """
+    if top_k == 0:
+        return []
+    mm = multimodal_mod.mm_config(config)
+    media_index = (multimodal_mod.media_by_key(records.values())
+                   if multimodal else {})
+    image_store = (multimodal_mod.ImageStore(Path(media_root))
+                   if media_root is not None else None)
+    max_images = max(0, int(mm.get("max_response_images", 8) or 0))
+    max_image_bytes = max(0, int(mm.get("max_image_bytes", 10 * 1024 * 1024) or 0))
+    max_response_bytes = max(0, int(mm.get("max_response_bytes",
+                                           30 * 1024 * 1024) or 0))
+    return_images = bool(mm.get("return_images", True))
+    image_count = 0
+    image_bytes = 0
+    seen_media: set[str] = set()
+    uri_cache: dict[str, str] = {}
+
     output: list[MemoryItem] = []
     seen_content: set[str] = set()
     for item in evidence:
+        if top_k > 0 and len(output) >= top_k:
+            break
         content = str(item.get("content") or "").strip()
         if not content:
             continue    # content is required and must be non-empty
@@ -113,8 +140,24 @@ def build_search_items(
         digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
         item_id = f"{anchor}_{digest[:8]}" if source else f"mem_{digest[:16]}"
         created_at = source.get("time") if source else None
-        rendered: Any = ([{"type": "text", "text": content}]
-                         if multimodal else content)
+        rendered: Any = content
+        if multimodal:
+            parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+            if (return_images and image_store is not None
+                    and image_count < max_images and max_image_bytes > 0):
+                media = next((media_index[key] for key in [anchor, *sources]
+                              if key and key in media_index), [])
+                image_parts, added, used = multimodal_mod.image_parts(
+                    media, image_store,
+                    max_images=max_images - image_count,
+                    max_image_bytes=max_image_bytes,
+                    remaining_bytes=max_response_bytes - image_bytes,
+                    seen=seen_media, uri_cache=uri_cache)
+                if added:
+                    parts.extend(image_parts)
+                    image_count += added
+                    image_bytes += used
+            rendered = parts
         output.append(MemoryItem(
             id=item_id,
             content=rendered,
@@ -139,6 +182,9 @@ class ApiState:
         self.search_sem = asyncio.Semaphore(max(1, int(config.get("concurrency", 32))))
         self.add_sem = asyncio.Semaphore(max(1, int(config.get("add_concurrency", 32))))
         self.log = Logger.from_config(config, prefix="api")
+        # One shared vision client; it is only used when an image arrives
+        # without a caption and multimodal.caption is enabled.
+        self.captioner = multimodal_mod.Captioner(config)
         self.api_key = str(config.get("api_key")
                             or os.environ.get("ASMEM_API_KEY") or "")
         self.search_timeout = max(0.0, float(config.get("search_timeout", 300) or 0))
@@ -226,6 +272,7 @@ class ApiState:
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
+        await self.captioner.aclose()
         self.log.close()
 
 
@@ -292,16 +339,35 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.post("/add", response_model=AddResponse, dependencies=auth)
     async def add(request: AddRequest) -> AddResponse:
-        messages = [
-            {"role": item.role, "content": normalize_content(item.content),
+        store = state.store(request.user_id)
+        # Idempotency is keyed on the RAW payload (including image bytes), not
+        # on generated captions: a retry after a caption-endpoint blip must not
+        # be rejected as "same request_id, different payload".
+        raw_messages = [
+            {"role": item.role, "content": item.content,
              "timestamp": item.timestamp}
             for item in request.messages
         ]
-        store = state.store(request.user_id)
+        payload_hash = store_mod.payload_hash(
+            request.user_id, request.session_id, raw_messages)
+        messages: list[dict[str, Any]] = []
+        media: list[dict[str, Any]] = []
+        image_budget = {"bytes": 0}      # whole request, not per message
+        for item in request.messages:
+            plan = await multimodal_mod.build_content(
+                item.content,
+                image_store=multimodal_mod.ImageStore(store.images_dir),
+                captioner=state.captioner,
+                config=state.config,
+                budget=image_budget)
+            messages.append({"role": item.role, "content": plan.text,
+                             "timestamp": item.timestamp})
+            media.extend(plan.images)
         async with state.add_sem:
             try:
                 await store.append(
-                    request.request_id, request.session_id, messages)
+                    request.request_id, request.session_id, messages,
+                    media=media, payload_hash=payload_hash)
                 success = True
                 retrieval = state.config.get("retrieval") or {}
                 if retrieval.get("index_on_add"):
@@ -326,9 +392,12 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     async def search(request: SearchRequest) -> SearchResponse:
         if not state.accepting:
             raise HTTPException(status_code=503, detail="server is shutting down")
-        query = normalize_content(request.query)
+        multimodal_query = isinstance(request.query, list)
+        query = ("" if multimodal_query
+                 else normalize_content(request.query)).strip()
+        query_images: list[str] = []
         options = [str(option) for option in (request.options or []) if str(option).strip()]
-        if not query.strip():
+        if not query and not multimodal_query:
             return SearchResponse(data=[])
         store = state.store(request.user_id)
         try:
@@ -340,6 +409,15 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                            f"{type(exc).__name__}: {exc}")
         if not store.has_memory():
             return SearchResponse(data=[])
+        if multimodal_query:
+            # Retrieval is caption-based: the query image contributes a short
+            # caption, and at most one inline image is kept for the bounded
+            # gate call.  The base64 never becomes part of the question text.
+            query, query_images = await multimodal_mod.query_content(
+                request.query, captioner=state.captioner,
+                config=state.config)
+            if not query.strip():
+                return SearchResponse(data=[])
 
         request_id = (request.request_id or "").strip()
 
@@ -350,7 +428,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                     config=state.config, run_root=store.runs_path, log=state.log,
                     options=options, cache_dir=store.cache_dir,
                     shared_dir=store.shared_dir,
-                    request_id=request_id, user_id=request.user_id)
+                    request_id=request_id, user_id=request.user_id,
+                    query_images=query_images)
                 if state.hard_timeout <= 0:
                     return await coro
                 return await asyncio.wait_for(coro, timeout=state.hard_timeout)
@@ -393,7 +472,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                  else int(state.config.get("top_k", 100)))
         data = build_search_items(
             result.get("evidence") or [], records,
-            multimodal=isinstance(request.query, list), top_k=limit)
+            multimodal=multimodal_query, top_k=limit,
+            media_root=store.images_dir, config=state.config)
         return SearchResponse(data=data)
 
     return app

@@ -56,6 +56,10 @@ CACHE_NAME = "cache"
 #: Version-1 names, kept for in-place compatibility.
 LEGACY_CACHE_NAME = "index"
 
+#: ``[image: <id>]`` markers written by the multimodal content planner.  They
+#: let the store attach image assets to every chunk of the same parent.
+_IMAGE_MARKER = re.compile(r"\[image:\s*([A-Za-z0-9_.-]+)\]")
+
 _SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 #: Characters that cannot appear verbatim in a path component.  ``%`` is
 #: escaped too, so the mapping stays injective (a literal ``%20`` cannot
@@ -69,11 +73,57 @@ class RequestConflictError(ValueError):
     """Same ``request_id`` with a different payload."""
 
 
-def _payload_hash(user_id: str, session_id: str, messages: list[dict[str, Any]]) -> str:
+def _payload_hash(user_id: str, session_id: str, messages: list[dict[str, Any]],
+                  media: list[dict[str, Any]] | None = None) -> str:
     material = json.dumps(
-        {"user_id": user_id, "session_id": session_id, "messages": messages},
+        {"user_id": user_id, "session_id": session_id, "messages": messages,
+         "media": media or []},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def payload_hash(user_id: str, session_id: str,
+                 messages: list[dict[str, Any]]) -> str:
+    """Public idempotency hash for the raw Add payload.
+
+    The API computes this *before* captioning so a retry whose generated
+    caption differs slightly still maps to the same ``request_id`` instead of
+    raising a spurious conflict.
+    """
+    return _payload_hash(user_id, session_id, messages)
+
+
+def _attach_media(records: list[dict[str, Any]],
+                  media: list[dict[str, Any]]) -> None:
+    """Attach image assets to records that reference them.
+
+    A message may be split into several chunks; only the chunk that contains
+    the ``[image: id]`` marker knows about it.  Media is therefore assigned per
+    parent, so every sibling chunk can return the same image.
+    """
+    by_id = {str(item.get("id")): item for item in media if item.get("id")}
+    if not by_id:
+        return
+    parent_media: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        found: list[str] = []
+        for match in _IMAGE_MARKER.finditer(str(record.get("text") or "")):
+            image_id = match.group(1)
+            if image_id in by_id and image_id not in found:
+                found.append(image_id)
+        if not found:
+            continue
+        meta = record.setdefault("meta", {})
+        parent = str(meta.get("parent_id") or record.get("id") or "")
+        bucket = parent_media.setdefault(parent, [])
+        for image_id in found:
+            if not any(item.get("id") == image_id for item in bucket):
+                bucket.append(by_id[image_id])
+    for record in records:
+        meta = record.setdefault("meta", {})
+        parent = str(meta.get("parent_id") or record.get("id") or "")
+        if parent in parent_media:
+            meta["media"] = [dict(item) for item in parent_media[parent]]
 
 
 def slug(user_id: str) -> str:
@@ -188,6 +238,11 @@ class UserStore:
     @property
     def runs_path(self) -> Path:
         return self.root / RUNS_NAME
+
+    @property
+    def images_dir(self) -> Path:
+        """Content-addressed image assets referenced by ``meta.media``."""
+        return self.root / "images"
 
     @property
     def cache_dir(self) -> Path:
@@ -329,9 +384,15 @@ class UserStore:
             changed = True
         return changed
 
-    async def append(self, request_id: str, session_id: str, messages: list[dict[str, Any]]) -> int:
+    async def append(self, request_id: str, session_id: str,
+                     messages: list[dict[str, Any]],
+                     *,
+                     media: list[dict[str, Any]] | None = None,
+                     payload_hash: str | None = None) -> int:
         ensure_layout(self.store_root)
-        payload_hash = _payload_hash(self.user_id, session_id, messages)
+        if payload_hash is None:
+            payload_hash = _payload_hash(self.user_id, session_id, messages, media)
+        media = media or []
         async with _lock(self.user_id):
             meta = self._meta()
             self._recover(meta)
@@ -357,6 +418,8 @@ class UserStore:
                 messages, session_id=session_id,
                 session_index=int(session["index"]), start_seq=start,
                 chunking=self.chunking)
+            if media:
+                _attach_media(records, media)
             next_seq = start + len(records)
             meta["pending"][request_id] = {
                 "session_id": session_id,

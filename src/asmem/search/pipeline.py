@@ -119,9 +119,13 @@ def _memory_fingerprint(memory_path: Path) -> str:
 
 
 def _payload_key(memory_path: Path, question: str,
-                 options: list[str] | None) -> str:
+                 options: list[str] | None,
+                 query_images: list[str] | None = None) -> str:
+    images = [hashlib.sha1(str(item).encode("utf-8")).hexdigest()[:16]
+              for item in (query_images or [])]
     material = json.dumps(
         {"question": question, "options": list(options or []),
+         "query_images": images,
          "memory": _memory_fingerprint(memory_path)},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
@@ -330,6 +334,7 @@ async def run_question(
     request_id: str = "",
     user_id: str = "",
     coarse_source: Path | None = None,
+    query_images: list[str] | None = None,
 ) -> dict[str, Any]:
     """Entry point used by the HTTP API.
 
@@ -346,15 +351,16 @@ async def run_question(
     run every call.
     """
     normalized = [str(item) for item in (options or []) if str(item).strip()]
+    images = [str(item) for item in (query_images or []) if str(item).strip()]
     if not request_id:
         return await run_search(
             memory_path=memory_path, question=question, config=config,
             run_root=run_root, model=model, log=log, dry_run=dry_run,
             options=normalized, cache_dir=cache_dir, shared_dir=shared_dir,
             dataset=dataset, answer_type=answer_type,
-            coarse_source=coarse_source)
+            coarse_source=coarse_source, query_images=images)
     request_key = f"{user_id}\0{request_id}"
-    payload_key = _payload_key(memory_path, question, normalized)
+    payload_key = _payload_key(memory_path, question, normalized, images)
     name = _run_id(question, request_key, payload_key)
     lock = _run_lock(name)
     try:
@@ -364,7 +370,8 @@ async def run_question(
                 run_root=run_root, model=model, log=log, dry_run=dry_run,
                 options=normalized, cache_dir=cache_dir, shared_dir=shared_dir,
                 dataset=dataset, answer_type=answer_type, request_key=request_key,
-                payload_key=payload_key, coarse_source=coarse_source)
+                payload_key=payload_key, coarse_source=coarse_source,
+                query_images=images)
     finally:
         # Keep the lock table bounded on a long-lived API process.
         if len(_RUN_LOCKS) > 1024:
@@ -390,9 +397,11 @@ async def run_search(
     request_key: str = "",
     payload_key: str = "",
     coarse_source: Path | None = None,
+    query_images: list[str] | None = None,
 ) -> dict[str, Any]:
     log = log or Logger.from_config(config, prefix="search")
     options = [str(item) for item in (options or []) if str(item).strip()]
+    query_images = [str(item) for item in (query_images or []) if str(item).strip()]
     run_root = run_root or (PROJECT_ROOT / "data" / "asmem_runs")
     started = time.perf_counter()
     qa, inputs, resumed = prepare_workspace(
@@ -554,6 +563,10 @@ async def run_search(
     local["answer_type"] = answer_type
     local["route"] = route
     local["deadline"] = deadline
+    # Kept out of the prompts unless a stage explicitly opts in: the evidence
+    # loop reads at most one query image on its first turn, and memory images
+    # are never sent to the postagent (captions are the searchable form).
+    local["query_images"] = list(query_images)
 
     result = None
     verdict = verifier.Verdict(sufficient=False)
@@ -695,6 +708,13 @@ async def run_search(
                                 "fact", "temporal", "duration", "yesno",
                                 "update", "conflict", "compare", "order",
                                 "multi_hop", "aggregate"})
+                        multimodal_cfg = (config.get("multimodal")
+                                          if isinstance(config.get("multimodal"), dict)
+                                          else {})
+                        image_mode = str(multimodal_cfg.get(
+                            "postagent_images") or "auto").lower()
+                        gate_images = ([] if image_mode == "never"
+                                       else list(query_images or []))
                         gate_verdict = await verifier.gate_verify(
                             question,
                             _compact_for_verifier(coarse_evidence, config),
@@ -702,7 +722,8 @@ async def run_search(
                             max_context_tokens=int(
                                 config.get(
                                     "verifier_max_context_tokens", 24000) or 0),
-                            check_consistency=check_consistency)
+                            check_consistency=check_consistency,
+                            images=gate_images)
                         gate_info["permissive_gate"] = gate_verdict.sufficient
                         gate_info["permissive_missing"] = list(
                             gate_verdict.missing)
@@ -844,6 +865,7 @@ async def run_search(
                                 "options": list(options or []),
                                 "intent": intent,
                                 "deadline": deadline,
+                                "query_images": list(query_images or []),
                             },
                             missing=gate_missing)
                     finally:

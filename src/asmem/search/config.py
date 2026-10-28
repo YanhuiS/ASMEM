@@ -195,6 +195,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_chars": 0, "overlap_chars": 0,
         },
     },
+    # Multimodal track.  Retrieval is caption-based: images are persisted as
+    # content-addressed files and never embedded.  Memory text carries only
+    # [caption] text and [image: <id>] markers, so a 10 MiB data URI can never
+    # reach BM25, evidence or a prompt.
+    "multimodal": {
+        "enabled": True,
+        "caption": True,
+        "caption_always": False,
+        "caption_query": True,
+        "caption_model": "",
+        "caption_base_url": "",
+        "caption_api_key": "",
+        "caption_max_chars": 300,
+        "caption_timeout": 20,
+        "max_image_bytes": 10485760,       # 10 MiB per decoded image
+        "max_request_bytes": 31457280,     # 30 MiB per Add request
+        "max_response_bytes": 31457280,    # 30 MiB per Search response
+        "max_response_images": 8,
+        "max_query_images": 1,
+        "return_images": True,
+        # auto: query image -> gate + first evidence-loop turn only.
+        # never: every internal prompt stays text-only.
+        # always: keep the query image on every loop turn.
+        "postagent_images": "auto",
+    },
     "log": {"level": "info"},
 }
 
