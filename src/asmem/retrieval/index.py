@@ -17,6 +17,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from operator import mul
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -317,11 +318,11 @@ class RetrievalIndex:
             for vector in group:
                 if not vector:
                     continue
-                base = sum(a * b for a, b in zip(base_vector, vector))
+                base = sum(map(mul, base_vector, vector))
                 score = base
                 if option_vectors and weight:
                     option_best = max(
-                        sum(a * b for a, b in zip(view, vector))
+                        sum(map(mul, view, vector))
                         for view in option_vectors)
                     score = base + weight * max(0.0, option_best - base)
                 best = score if best is None else max(best, score)

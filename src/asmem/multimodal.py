@@ -421,7 +421,10 @@ async def build_content(
         return ContentPlan(text=normalize_content(content))
 
     parts = _as_list(content)
-    has_text = any(part_text(part).strip() for part in parts)
+    # part_text() is a pure scan of the part; compute it once and reuse it for
+    # both the has_text probe and the loop below.
+    part_texts = [part_text(part) for part in parts]
+    has_text = any(text.strip() for text in part_texts)
     out: list[str] = []
     images: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -434,8 +437,7 @@ async def build_content(
                     and mm.get("caption", True)
                     and (not has_text or mm.get("caption_always", False)))
 
-    for part in parts:
-        text = part_text(part)
+    for part, text in zip(parts, part_texts):
         if text.strip():
             out.append(text)
             context_parts.append(text.strip())

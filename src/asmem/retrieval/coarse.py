@@ -11,12 +11,12 @@ import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from .index import RetrievalIndex, build_index, parse_time_expr
 from .parents import choose_resolution
 from .router import route_query
-from .tokenize import extract_phrases, jaccard, normalize_text, terms, tokenize
+from .tokenize import extract_phrases, normalize_text, terms, tokenize
 
 DEFAULT_CHANNELS = {
     "bm25": 0.5, "dense": 0.5, "exact": 0.3, "time": 0.2,
@@ -105,10 +105,12 @@ def _why(
     phrases: Sequence[str],
     channels: dict[str, float],
     options: Sequence[str],
+    record_terms: Iterable[str] | None = None,
 ) -> list[str]:
     why: list[str] = []
-    matched = [term for term in sorted(query_terms)[:8]
-               if term in terms(str(record.get("text") or ""))]
+    if record_terms is None:
+        record_terms = terms(str(record.get("text") or ""))
+    matched = [term for term in sorted(query_terms)[:8] if term in record_terms]
     for term in matched[:4]:
         why.append(f"bm25:{term}")
     text = normalize_text(str(record.get("text") or ""))
@@ -344,12 +346,47 @@ async def run_coarse(
             add(index_)
 
     dedup_threshold = float(coarse_cfg.get("dedup_jaccard", 0.9))
+    # The dedup loop used to re-tokenize every already-selected record for
+    # every candidate (O(candidates x selected) full-text passes).  Token sets
+    # are pure functions of the text, so build each record's set once and
+    # compare sets.  jaccard(A, B) <= min(|A|, |B|) / max(|A|, |B|), so the
+    # length bound rejects most pairs without touching their elements.
+    raw_term_sets: dict[int, frozenset[str]] = {}
+    normalized_term_sets: dict[int, frozenset[str]] = {}
+
+    def raw_term_set(index_: int) -> frozenset[str]:
+        cached = raw_term_sets.get(index_)
+        if cached is None:
+            cached = frozenset(tokenize(str(records[index_].get("text") or "")))
+            raw_term_sets[index_] = cached
+        return cached
+
+    def normalized_term_set(index_: int) -> frozenset[str]:
+        cached = normalized_term_sets.get(index_)
+        if cached is None:
+            cached = frozenset(tokenize(normalize_text(
+                str(records[index_].get("text") or ""))))
+            normalized_term_sets[index_] = cached
+        return cached
+
+    def near_duplicate(left: frozenset[str], right: frozenset[str],
+                       threshold: float) -> bool:
+        """Exact ``jaccard(left, right) >= threshold`` with a cheap prefilter."""
+        if not left or not right:
+            return 0.0 >= threshold
+        la, lb = len(left), len(right)
+        shorter, longer = (la, lb) if la < lb else (lb, la)
+        if shorter < threshold * longer:
+            return False
+        return len(left & right) / len(left | right) >= threshold
+
     for index_ in ordered:
         if len(selected) >= limit:
             break
-        text = normalize_text(str(records[index_].get("text") or ""))
-        if any(jaccard(terms(text), terms(str(records[other].get("text") or "")))
-               >= dedup_threshold for other in selected):
+        candidate_terms = normalized_term_set(index_)
+        if any(near_duplicate(candidate_terms, raw_term_set(other),
+                              dedup_threshold)
+               for other in selected):
             continue
         add(index_)
 
@@ -378,7 +415,8 @@ async def run_coarse(
             channels=doc_channels.get(index_, {}),
             why=_why(index_, records[index_],
                      query_terms=set(query_tokens), phrases=phrases,
-                     channels=doc_channels.get(index_, {}), options=options),
+                     channels=doc_channels.get(index_, {}), options=options,
+                     record_terms=raw_term_set(index_)),
             neighbor_of=None,
             route=route.name, question=question, config=config,
         )
