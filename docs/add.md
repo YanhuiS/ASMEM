@@ -249,10 +249,19 @@ data/asmem/<user>/
   state.jsonl         # 派生状态索引
   meta.json           # sessions / applied / pending / counts
   images/             # 多模态图片资源（内容寻址）+ captions/ 缓存
+  requests/           # 原始 Add/Search 请求日志（内容寻址，图片外部化）
   index/              # BM25/dense/state 的懒加载产物（可选）
   cache/              # embedding 缓存
   runs/               # search workspace
 ```
+
+多模态图片真正只存一份：新图片只写 `<store>/shared/images/<xx>/<sha>.<ext>`，
+不再在 `<user>/images/` 建副本；读取时先查用户目录（兼容旧 store），再查 shared。
+caption 同理只放在 `shared/images/captions/<sha>.txt`。旧 store 可用
+`scripts/dedupe_store_images.py --root <store> --confirm` 去掉用户目录里的重复入口
+（先重启 API，旧进程只查用户目录）。`requests/` 按 payload 的 SHA-256 写一次，
+`data:image/...;base64,...` 被替换成 `asmem-image:<sha256>`，所以日志不会重复
+保存图片字节。
 
 ---
 

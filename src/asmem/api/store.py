@@ -10,6 +10,8 @@ Layout (version 2)::
           state.jsonl            # derived state index
           meta.json / .bak       # add WAL + counters
           cache/                 # embedding cache (one dir per identity)
+          requests/              # raw Add/Search payloads + responses (once)
+          images/                # legacy per-user images (read-only fallback)
           runs/
             <run id>/            # one search request, flat
               request.json evidence.jsonl summary.json ...
@@ -17,6 +19,7 @@ Layout (version 2)::
               bin -> ../../../../shared/bin
       shared/
         bin/                     # helper CLIs shared by every run
+        images/                  # content-addressed blobs + captions (one copy)
 
 Add is pure CPU: normalize -> append.  Idempotency is by ``request_id``; a
 small write-ahead log in ``meta.json`` makes an interrupted add recoverable.
@@ -53,6 +56,8 @@ USERS_DIR = "users"
 SHARED_DIR = "shared"
 RUNS_NAME = "runs"
 CACHE_NAME = "cache"
+REQUESTS_NAME = "requests"
+IMAGES_NAME = "images"
 #: Version-1 names, kept for in-place compatibility.
 LEGACY_CACHE_NAME = "index"
 
@@ -191,6 +196,9 @@ def ensure_layout(root: Path) -> None:
     """Create ``users/``, ``shared/bin/`` and the store manifest."""
     (root / USERS_DIR).mkdir(parents=True, exist_ok=True)
     (root / SHARED_DIR / "bin").mkdir(parents=True, exist_ok=True)
+    (root / SHARED_DIR / "images").mkdir(parents=True, exist_ok=True)
+    (root / SHARED_DIR / "images" / "captions").mkdir(
+        parents=True, exist_ok=True)
     meta_path = root / STORE_META_NAME
     if meta_path.exists():
         return
@@ -201,12 +209,16 @@ def ensure_layout(root: Path) -> None:
             "users": USERS_DIR,
             "shared": SHARED_DIR,
             "user_files": [MEMORY_NAME, STATE_NAME, META_NAME,
-                           META_BACKUP_NAME, RUNS_NAME, CACHE_NAME],
+                           META_BACKUP_NAME, RUNS_NAME, CACHE_NAME,
+                           IMAGES_NAME, REQUESTS_NAME],
             "run_files": ["request.json", "evidence.jsonl", "summary.json",
                           "steps.jsonl", "agent_history.jsonl", "inputs/", "bin"],
         },
         "notes": "runs/*/inputs/memory.jsonl and state.jsonl are hardlinks "
-                 "to the user's live files; runs/*/bin links to shared/bin.",
+                 "to the user's live files; runs/*/bin links to shared/bin. "
+                 "requests/ stores each raw Add/Search payload once, keyed by "
+                 "SHA-256, with inline images externalized to shared/images "
+                 "(one blob per SHA-256; <user>/images is legacy fallback).",
     }, ensure_ascii=False, indent=2))
 
 
@@ -242,7 +254,32 @@ class UserStore:
     @property
     def images_dir(self) -> Path:
         """Content-addressed image assets referenced by ``meta.media``."""
-        return self.root / "images"
+        return self.root / IMAGES_NAME
+
+    @property
+    def shared_images_dir(self) -> Path:
+        """Store-level content-addressed blob store shared by every user."""
+        return self.store_root / SHARED_DIR / IMAGES_NAME
+
+    @property
+    def image_store(self):
+        """An ``ImageStore`` that dedupes bytes across users.
+
+        Kept as a property (not a stored instance) because the store root is
+        mutated by recovery helpers before the first use.
+        """
+        from ..multimodal import ImageStore
+
+        return ImageStore(self.images_dir, shared_root=self.shared_images_dir)
+
+    @property
+    def journal(self):
+        """Content-addressed raw request/response journal for this user."""
+        from .journal import RequestJournal
+
+        return RequestJournal(self.root / REQUESTS_NAME,
+                              image_store=self.image_store,
+                              config=self.config)
 
     @property
     def cache_dir(self) -> Path:

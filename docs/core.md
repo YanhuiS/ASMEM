@@ -186,6 +186,51 @@ build_search_items：text ContentPart 在前，命中的 memory 图按预算追�
   `max_response_images` 限制；放不下的图直接跳过，不截断响应。
 - caption 端点失败不影响 Add：降级为同条 text / `[image: <id>]`，`/add` 仍返回
   `success=true`。
+- **响应格式按赛道，不按单次 query 形态。** 竞赛契约规定多模态赛道的
+  `data[].content` 必须是有序 `ContentPart[]`，即使这道题只有文本。旧实现只在
+  `query` 本身是数组时才返回 parts，文本 query 会返回字符串，属于多模态赛道的
+  契约不匹配。`multimodal.response_parts: always`（api_mm.yaml）让多模态部署始终
+  返回 parts；文本/代码赛道保持 `auto`（字符串）。
+- **查询图也内容寻址。** Search 的 query 图会写入同一个 `ImageStore`，caption 走
+  按 sha256 的缓存。同一张图在多道题/多个用户之间只存一份物理文件，也只会调用
+  一次 vision caption。
+
+#### 3.5.0 多模态存储去重
+
+- **图片**：新写入只落一份到 `<store>/shared/images/<sha[:2]>/<sha>.<ext>`，不再
+  在 `<user>/images/` 建副本或 hardlink。`meta.media.path` 仍是相对路径，
+  `ImageStore.resolve()` 先查用户目录（兼容旧 store），再查 shared 目录。因此
+  同一张图跨用户、跨 Add/Search 只有一个物理文件、一个路径。
+- **caption**：`<store>/shared/images/captions/<sha>.txt` 是唯一副本；旧 store 的
+  用户目录 caption 仍可读（shared 优先），查询图复用同一缓存。
+- **memory 元数据**：`meta.media` 只重复很小的 `{id, sha256, mime, bytes, path}`，
+  不重复图片字节。
+- **runs 快照**：`runs/<id>/inputs/memory.jsonl` 仍是 hardlink，不复制语料。
+- **旧 store 迁移**：`python scripts/dedupe_store_images.py --root data/api_store_mm --confirm`
+  把用户目录里的重复图片入口移到/合并到 `shared/images`；默认 dry-run，会校验
+  SHA-256。若 6006 还是旧进程（只 resolve 用户目录），先重启再运行，否则旧进程会
+  暂时看不到已经移到 shared 的图片。
+
+#### 3.5.0.1 原始请求日志（`api/requests`）
+
+平台契约问题靠 summary 无法定位，因此 API 把**原始请求体**按内容哈希保存一次：
+
+```text
+<user>/requests/
+  add/<sha[:2]>/<sha>.json          # request_id / session_id / messages
+  search/<sha[:2]>/<sha>.json       # query / options / top_k
+  search/responses/<req sha>/...    # 实际返回的 data[]
+  invalid/<sha[:2]>/<sha>.json      # 422 的原始报文（契约排查）
+```
+
+- 文件名是**外部化后 payload** 的 SHA-256；同一请求重试只写一次。
+- 内联 `data:image/...;base64,...` 被替换成 `asmem-image:<sha256>`，图片字节只存在于
+  内容寻址的 ImageStore；日志里**没有 base64**。
+- 响应按 `(request sha, response sha)` 写一次；`request_journal_responses: false`
+  可关闭。
+- 写日志失败不会让 `/add` 或 `/search` 失败；`/health.last_error` 只记录真正影响
+  服务的问题。
+- 日志是审计产物，不参与检索；30 天保留要求由部署方按需清理。
 
 #### 3.5.1 Mem-Gallery：带 image id 的多 session 对话记忆
 
@@ -285,6 +330,11 @@ score，还报告 gold `evidence_ids` 是否出现在 answer-visible evidence �
   立即释放 `search_sem`，避免僵尸任务占满并发。
 - **进程级 endpoint breaker**：`llm_global_breaker_failures > 0` 时，端点连续失败会打开
   全局熔断，新请求快速进入 coarse fallback，而不是各自重试。
+- **远程端点显式绕过失效代理**：部署环境（例如 AutoDL）常导出 `http_proxy` /
+  `https_proxy`，但代理本身可能已经不可用。httpx 默认 `trust_env=true`，会先连接
+  代理，失败后报 `ConnectError: All connection attempts failed`——看起来像模型
+  端点挂了，实际请求根本没出机器。API 配置用 `trust_env: false` 让 generator、
+  captioner、embedding 全部直连；`Captioner` 的 call config 也显式继承该设置。
 - **上下文保护**：`model_input_token_cap` 在每次模型调用前做 token 预检；
   端点返回 context overflow 时，`ModelRunner` 会把 prompt 缩到 1/2、1/4 再试一次
   （`context_overflow_retries`），仍失败才降级。
@@ -297,6 +347,11 @@ score，还报告 gold `evidence_ids` 是否出现在 answer-visible evidence �
 /add    -> api.store.UserStore.append -> schema.normalize_messages
 /search -> search.runner.run_question -> api.server.build_search_items
 ```
+
+每个 `/add` / `/search` 的原始 JSON 还会按内容哈希写一份到 `<user>/requests/`
+（图片只写 `asmem-image:<sha256>`，不写 base64），响应写在 request 旁；写入失败
+不影响协议响应。这样平台报契约错误时，可以直接看到它实际发送的 `content` 形态和
+我们实际返回的 `data[]`。
 
 `configs/api.yaml` 和 `configs/asmem.yaml` 都是核心配置：
 
@@ -331,7 +386,13 @@ multimodal:
   max_request_bytes: 31457280
   max_response_bytes: 31457280
   max_response_images: 8
+  response_parts: always      # multimodal track: always ContentPart[]
   postagent_images: auto      # auto / never / always
+# Raw request audit (content-addressed, images externalized)
+request_journal: true
+request_journal_responses: true
+# Remote endpoints: ignore a possibly-dead http(s)_proxy in the environment.
+trust_env: false
 # Timeout / queue / fallback
 search_queue_timeout: 60
 fallback_enabled: true

@@ -259,6 +259,7 @@ docs/
   core.md, add.md, search.md
 scripts/
   run_bench.py, compare_runs.py, coarse, sample_bench.py
+  dedupe_store_images.py            # migrate legacy per-user image entries
   test_asmem.py, test_bench.py, test_retrieval.py, test_evidence_loop.py
 ```
 
@@ -269,6 +270,7 @@ python scripts/test_evidence_loop.py     # gate checks + evidence loop (CPU only
 python scripts/test_retrieval.py  # coarse / chunk / neighbours / comparison loop
 python scripts/test_bench.py      # benchmark pipeline (no model calls)
 python scripts/test_multimodal.py # captions, image assets, bounded responses
+python scripts/test_api_journal.py # raw request audit + cross-user image dedupe
 python scripts/test_asmem.py      # add / store / API contracts
 ```
 

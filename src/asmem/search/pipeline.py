@@ -986,11 +986,18 @@ async def run_search(
                         qa / evidence.EVIDENCE_NAME, loop_result.evidence)
                     raw_evidence = _attach_source_times(
                         loop_result.evidence, records)
+                    # A model outage is not a sufficient answer: the coarse
+                    # seeds are returned, but the summary must not look like a
+                    # completed audit (and a degraded run must not be cached).
+                    loop_failed = loop_result.stop_reason in {
+                        "model_error", "deadline"}
                     verdict = verifier.Verdict(
-                        sufficient=bool(loop_result.evidence),
+                        sufficient=bool(loop_result.evidence) and not loop_failed,
                         missing=list(loop_result.missing),
                         reasoning=f"evidence_loop:{loop_result.stop_reason}")
                     stop_reason = loop_result.stop_reason
+                    if loop_failed:
+                        degraded = True
                     compile_info = dict(loop_result.stats)
                     rounds = 0
                 elif (not gate_skipped and postagent_mode == "compile"

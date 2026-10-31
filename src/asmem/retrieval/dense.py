@@ -251,6 +251,9 @@ def build_embedder(config: dict[str, Any]) -> Any | None:
             int(config.get("concurrency", 8)),
             int(config.get("max_retries", 3)),
             float(config.get("timeout", 300)),
+            # A cached client built with trust_env=True keeps using a dead
+            # environment proxy; include the policy in the identity.
+            str(config.get("trust_env")),
         )
         embedder = _EMBEDDER_CACHE.get(key)
         if embedder is None:

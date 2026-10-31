@@ -209,14 +209,24 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 class ImageStore:
-    """Content-addressed ``<user>/images/`` directory.
+    """Content-addressed image blob store (one physical copy per SHA-256).
 
-    File name = SHA-256 of the decoded bytes, so the same image added twice
-    occupies one file and the id is stable across retries.
+    With ``shared_root`` set (the API layout), bytes are written **once** to
+    ``<store>/shared/images/<sha[:2]>/<sha>.<ext>`` and no per-user copy or
+    hardlink is created.  Media references keep the same relative path;
+    :meth:`resolve` checks the user directory first (legacy stores) and then
+    the shared directory.  Without ``shared_root`` (tests, bench helpers), the
+    store behaves like the old per-user ``images/`` directory.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, shared_root: Path | None = None) -> None:
         self.root = Path(root)
+        self.shared_root = Path(shared_root) if shared_root is not None else None
+
+    def _blob_path(self, sha: str, ext: str,
+                   root: Path | None = None) -> Path:
+        base = Path(root) if root is not None else self.root
+        return base / sha[:2] / f"{sha}.{ext}"
 
     def save(self, data: bytes, mime: str) -> dict[str, Any]:
         mime = {"image/jpg": "image/jpeg"}.get(mime, mime)
@@ -224,30 +234,54 @@ class ImageStore:
         if ext is None:
             raise ValueError(f"unsupported image mime: {mime}")
         sha = hashlib.sha256(data).hexdigest()
-        path = self.root / sha[:2] / f"{sha}.{ext}"
+        if self.shared_root is not None:
+            base = self.shared_root
+            storage = "shared"
+        else:
+            base = self.root
+            storage = "user"
+        path = self._blob_path(sha, ext, base)
         if not path.exists():
-            _atomic_write_bytes(path, data)
+            try:
+                _atomic_write_bytes(path, data)
+            except OSError:
+                if storage != "shared":
+                    raise
+                # A read-only shared directory must not break Add: fall back
+                # to the per-user directory (resolve() checks both).
+                base = self.root
+                storage = "user"
+                path = self._blob_path(sha, ext, base)
+                _atomic_write_bytes(path, data)
         return {
             "id": sha[:16],
             "sha256": sha,
             "mime": mime,
             "bytes": len(data),
-            "path": str(path.relative_to(self.root)),
+            "path": str(path.relative_to(base)),
+            "storage": storage,
         }
 
     def resolve(self, media: dict[str, Any]) -> Path | None:
         relative = str(media.get("path") or "")
         if not relative:
             return None
-        try:
-            root = self.root.resolve()
-            path = (self.root / relative).resolve()
-        except OSError:
-            return None
-        # Never let a hand-edited meta.media path escape the image directory.
-        if path != root and root not in path.parents:
-            return None
-        return path if path.exists() else None
+        # Legacy stores keep images under the user directory; new API writes
+        # keep only the shared blob.  Never let a hand-edited meta.media path
+        # escape either image directory.
+        for base in (self.root, self.shared_root):
+            if base is None:
+                continue
+            try:
+                root = base.resolve()
+                path = (base / relative).resolve()
+            except OSError:
+                continue
+            if path != root and root not in path.parents:
+                continue
+            if path.exists():
+                return path
+        return None
 
     def data_uri(self, media: dict[str, Any]) -> str:
         path = self.resolve(media)
@@ -264,19 +298,44 @@ class ImageStore:
     def _caption_path(self, sha: str) -> Path:
         return self.root / "captions" / f"{sha}.txt"
 
+    def _shared_caption_path(self, sha: str) -> Path | None:
+        if self.shared_root is None:
+            return None
+        return self.shared_root / "captions" / f"{sha}.txt"
+
     def read_caption(self, sha: str) -> str:
         if not sha:
             return ""
-        try:
-            return self._caption_path(sha).read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
+        # Shared is canonical; a legacy per-user copy can be older after
+        # another user replaced the caption atomically.
+        paths: list[Path] = []
+        shared = self._shared_caption_path(sha)
+        if shared is not None:
+            paths.append(shared)
+        paths.append(self._caption_path(sha))
+        for path in paths:
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if value:
+                return value
+        return ""
 
     def write_caption(self, sha: str, caption: str) -> None:
         if not sha or not caption:
             return
+        data = caption.encode("utf-8")
+        shared = self._shared_caption_path(sha)
+        if shared is not None:
+            try:
+                _atomic_write_bytes(shared, data)
+                return
+            except OSError:
+                pass
+        # Legacy/read-only shared layout: keep the user-local copy.
         try:
-            _atomic_write_bytes(self._caption_path(sha), caption.encode("utf-8"))
+            _atomic_write_bytes(self._caption_path(sha), data)
         except OSError:
             pass
 
@@ -319,6 +378,18 @@ class Captioner:
             "max_retries": 1,
             "retry_truncated": False,
         }
+        # The caption client is built from this dict, not from
+        # ``merge_call_config``, so propagate the proxy policy explicitly.
+        # Otherwise a dead http(s)_proxy in the service environment makes
+        # every caption fail even though the generator/embedding paths bypass
+        # it.
+        trust_env = mm.get("trust_env")
+        if trust_env is None:
+            trust_env = self.config.get("trust_env")
+        if trust_env is None:
+            trust_env = generator.get("trust_env")
+        if trust_env is not None:
+            self.call_config["trust_env"] = bool(trust_env)
         self.client: Any = None
         self.last_error = ""
         self.failures = 0
@@ -512,12 +583,19 @@ async def query_content(
     *,
     captioner: Captioner | None = None,
     config: dict[str, Any] | None = None,
+    image_store: ImageStore | None = None,
+    media_out: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str]]:
     """Normalize a Search query to ``(retrieval_text, attachable_data_uris)``.
 
-    Query images are not persisted.  Their captions make them searchable; at
-    most ``max_query_images`` inline images are returned for the one bounded
-    model call that needs to see them (the gate).
+    When ``image_store`` is supplied, a query image is persisted with the same
+    content-addressed store as Add (one file per hash) and its caption is read
+    from / written to that store's cache.  Repeating the same image across
+    searches therefore costs neither a second copy nor a second vision call.
+    At most ``max_query_images`` inline images are returned for the bounded
+    model call that needs to see them (the gate / first loop turn).
+
+    ``media_out`` receives the stored asset metadata for the request journal.
     """
     if isinstance(query, str):
         return query.strip(), []
@@ -540,6 +618,7 @@ async def query_content(
     attached: list[str] = []
     total_bytes = 0
     text_so_far = ""
+    seen_media: set[str] = set()
     for part in parts:
         text = part_text(part)
         if text.strip():
@@ -554,8 +633,21 @@ async def query_content(
         valid = (parsed is not None and parsed[0] in SUPPORTED_MIME
                  and len(parsed[1]) <= max_image
                  and total_bytes + len(parsed[1]) <= max_request)
+        asset: dict[str, Any] | None = None
+        if valid and image_store is not None:
+            try:
+                asset = image_store.save(parsed[1], parsed[0])
+            except (OSError, ValueError):
+                asset = None
         if not caption and generate and valid:
-            caption = await captioner.caption(url, hint=text_so_far)
+            sha = (str(asset.get("sha256")) if asset else
+                   hashlib.sha256(parsed[1]).hexdigest())
+            if image_store is not None:
+                caption = image_store.read_caption(sha)
+            if not caption:
+                caption = await captioner.caption(url, hint=text_so_far)
+                if caption and image_store is not None:
+                    image_store.write_caption(sha, caption)
         if caption:
             out.append(f"[caption] {caption}")
         if valid and len(attached) < max_attach:
@@ -565,6 +657,11 @@ async def query_content(
             out.append(data_uri_label(url) if url else "[image]")
         else:
             out.append(f"[image: {_image_id(url)}]")
+        if asset is not None and media_out is not None:
+            asset["caption"] = caption
+            if asset["sha256"] not in seen_media:
+                seen_media.add(asset["sha256"])
+                media_out.append(asset)
     return "\n".join(item.strip() for item in out if item and item.strip()), attached
 
 

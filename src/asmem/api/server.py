@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import time
 import uuid
@@ -66,6 +67,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "fallback_concurrency": 8,
     "fallback_evidence_limit": 12,
     "fallback_keep_files": False,
+    # Raw request journal.  Every /add and /search payload is written once,
+    # keyed by SHA-256, with inline images externalized to the content-
+    # addressed image store.  Responses are optional but useful for contract
+    # debugging; they never affect the protocol response.
+    "request_journal": True,
+    "request_journal_responses": True,
     # How long a shutdown waits for running searches to finish.
     "shutdown_timeout": 20,
     # /health aggregates per-user meta/memory line counts no more often.
@@ -100,6 +107,7 @@ def build_search_items(
     multimodal: bool = False,
     top_k: int = 100,
     media_root: Path | str | None = None,
+    shared_media_root: Path | str | None = None,
     config: dict[str, Any] | None = None,
 ) -> list[MemoryItem]:
     """Map runner evidence to the competition's Search response contract.
@@ -125,8 +133,10 @@ def build_search_items(
     mm = multimodal_mod.mm_config(config)
     media_index = (multimodal_mod.media_by_key(records.values())
                    if multimodal else {})
-    image_store = (multimodal_mod.ImageStore(Path(media_root))
-                   if media_root is not None else None)
+    image_store = (multimodal_mod.ImageStore(
+        Path(media_root),
+        shared_root=Path(shared_media_root) if shared_media_root else None)
+        if media_root is not None else None)
     max_images = max(0, int(mm.get("max_response_images", 8) or 0))
     max_image_bytes = max(0, int(mm.get("max_image_bytes", 10 * 1024 * 1024) or 0))
     max_response_bytes = max(0, int(mm.get("max_response_bytes",
@@ -192,6 +202,23 @@ def build_search_items(
     return output[:top_k] if top_k > 0 else []
 
 
+def response_uses_parts(config: dict[str, Any], query_is_parts: bool) -> bool:
+    """Whether ``data[].content`` must be a ``ContentPart[]``.
+
+    The competition contract is per *track*, not per request: a multimodal
+    deployment must return ordered parts even for a text-only question.  The
+    default ``auto`` mirrors the request shape (backwards compatible); the
+    multimodal API config sets ``response_parts: always``.
+    """
+    mm = multimodal_mod.mm_config(config)
+    mode = str(mm.get("response_parts") or "auto").strip().lower()
+    if mode in {"always", "parts", "multimodal", "contentparts"}:
+        return True
+    if mode in {"never", "text", "string"}:
+        return False
+    return bool(query_is_parts)
+
+
 class ApiState:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -221,6 +248,9 @@ class ApiState:
         self.fallback_sem = asyncio.Semaphore(self.fallback_concurrency)
         self.fallback_keep_files = bool(
             config.get("fallback_keep_files", False))
+        self.journal_enabled = bool(config.get("request_journal", True))
+        self.journal_responses = bool(
+            config.get("request_journal_responses", True))
         self.started_at = time.time()
         self.accepting = True
         self.inflight = 0
@@ -325,6 +355,69 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.api = ApiState(config)
     state: ApiState = app.state.api
 
+    async def _raw_payload(http_request: Request) -> Any:
+        """The exact JSON body, or a compact fingerprint if it is not JSON.
+
+        FastAPI has already parsed the body, so ``Request.body()`` returns the
+        cached bytes: no second read of a 30 MiB multimodal request.
+        """
+        try:
+            body = await http_request.body()
+        except Exception:  # noqa: BLE001 - journaling is best effort
+            return None
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return {"_raw_sha256": hashlib.sha256(body).hexdigest(),
+                    "_raw_bytes": len(body)}
+
+    async def _journal_request(store: store_mod.UserStore, kind: str,
+                               payload: Any,
+                               meta: dict[str, Any]) -> dict[str, Any] | None:
+        if not state.journal_enabled or payload is None:
+            return None
+
+        def _write() -> dict[str, Any]:
+            return store.journal.record(kind, payload, meta=meta)
+
+        try:
+            # Externalizing a 30 MiB multimodal body means decoding/hashing
+            # images; keep that off the event loop.
+            ref = await asyncio.to_thread(_write)
+        except Exception as exc:  # noqa: BLE001 - never fail the protocol
+            state.log.warn(f"request journal failed kind={kind}: "
+                           f"{type(exc).__name__}: {exc}")
+            return None
+        if ref.get("created"):
+            state.log.info(
+                f"journal {kind} sha={ref['sha256'][:12]} "
+                f"media={ref.get('media', 0)}")
+        return ref
+
+    async def _journal_response(store: store_mod.UserStore, kind: str,
+                                request_ref: dict[str, Any] | None,
+                                response: Any,
+                                meta: dict[str, Any] | None = None) -> None:
+        if (not state.journal_responses or request_ref is None):
+            return
+
+        def _write() -> None:
+            store.journal.record_response(
+                kind, request_ref, response, meta=meta)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:  # noqa: BLE001 - never fail the protocol
+            state.log.warn(f"response journal failed kind={kind}: "
+                           f"{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _items_payload(items: list[MemoryItem]) -> dict[str, Any]:
+        # Exactly what the route serializes with response_model_exclude_none.
+        return {"data": [item.model_dump(exclude_none=True) for item in items]}
+
     def require_api_key(
         x_api_key: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
@@ -353,6 +446,20 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         ]
         state.log.warn(
             f"request validation failed path={request.url.path} errors={safe_errors}")
+        # A contract mismatch often looks like a 422 on the platform side.
+        # Keep the exact payload (images externalized) so it can be replayed.
+        try:
+            payload = await _raw_payload(request)
+            if isinstance(payload, dict):
+                user_id = str(payload.get("user_id") or "").strip()
+                if user_id:
+                    await _journal_request(
+                        state.store(user_id), "invalid", payload,
+                        {"path": request.url.path,
+                         "errors": safe_errors})
+        except Exception as exc:  # noqa: BLE001 - never fail the error path
+            state.log.warn(f"invalid-request journal failed: "
+                           f"{type(exc).__name__}: {exc}")
         return JSONResponse(status_code=422, content={"detail": safe_errors})
 
     @app.get("/health")
@@ -371,8 +478,19 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         }
 
     @app.post("/add", response_model=AddResponse, dependencies=auth)
-    async def add(request: AddRequest) -> AddResponse:
+    async def add(request: AddRequest, http_request: Request) -> AddResponse:
         store = state.store(request.user_id)
+        # Keep the exact platform payload once (images externalized).  This is
+        # independent of the idempotency hash below: a retry reuses the same
+        # content-addressed journal file, and an interrupted caption call no
+        # longer erases the raw input.
+        raw_payload = await _raw_payload(http_request)
+        request_ref = await _journal_request(
+            store, "add", raw_payload,
+            {"request_id": request.request_id,
+             "user_id": request.user_id,
+             "session_id": request.session_id,
+             "messages": len(request.messages)})
         # Idempotency is keyed on the RAW payload (including image bytes), not
         # on generated captions: a retry after a caption-endpoint blip must not
         # be rejected as "same request_id, different payload".
@@ -386,10 +504,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         messages: list[dict[str, Any]] = []
         media: list[dict[str, Any]] = []
         image_budget = {"bytes": 0}      # whole request, not per message
+        image_store = store.image_store
         for item in request.messages:
             plan = await multimodal_mod.build_content(
                 item.content,
-                image_store=multimodal_mod.ImageStore(store.images_dir),
+                image_store=image_store,
                 captioner=state.captioner,
                 config=state.config,
                 budget=image_budget)
@@ -417,22 +536,54 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                     f"add failed user={request.user_id} "
                     f"request={request.request_id}: {type(exc).__name__}: {exc}")
                 success = False
-        return AddResponse(success=success, request_id=request.request_id,
-                           user_id=request.user_id, session_id=request.session_id)
+        response = AddResponse(
+            success=success, request_id=request.request_id,
+            user_id=request.user_id, session_id=request.session_id)
+        await _journal_response(store, "add", request_ref,
+                                response.model_dump(exclude_none=True),
+                                {"request_id": request.request_id,
+                                 "success": success})
+        return response
 
     @app.post("/search", response_model=SearchResponse,
               response_model_exclude_none=True, dependencies=auth)
-    async def search(request: SearchRequest) -> SearchResponse:
+    async def search(request: SearchRequest,
+                     http_request: Request) -> SearchResponse:
         if not state.accepting:
             raise HTTPException(status_code=503, detail="server is shutting down")
-        multimodal_query = isinstance(request.query, list)
+        # A single ContentPart is not the documented shape, but tolerating it
+        # is strictly better than stringifying a dict into the question.
+        multimodal_query = isinstance(request.query, (list, dict))
         query = ("" if multimodal_query
                  else normalize_content(request.query)).strip()
-        query_images: list[str] = []
         options = [str(option) for option in (request.options or []) if str(option).strip()]
-        if not query and not multimodal_query:
-            return SearchResponse(data=[])
+        request_id = (request.request_id or "").strip()
+        limit = (request.top_k if request.top_k is not None
+                 else int(state.config.get("top_k", 100)))
+        response_parts = response_uses_parts(state.config, multimodal_query)
         store = state.store(request.user_id)
+        # Persist the exact query (text and ordered parts, images externalized)
+        # before any normalization.  Repeated queries reuse one journal file.
+        raw_payload = await _raw_payload(http_request)
+        request_ref = await _journal_request(
+            store, "search", raw_payload,
+            {"request_id": request_id,
+             "user_id": request.user_id,
+             "query_parts": multimodal_query,
+             "options": len(options),
+             "top_k": limit})
+
+        async def _finish(data: list[MemoryItem], *,
+                          reason: str = "") -> SearchResponse:
+            await _journal_response(
+                store, "search", request_ref, _items_payload(data),
+                {"reason": reason, "request_id": request_id,
+                 "query_parts": multimodal_query,
+                 "response_parts": response_parts})
+            return SearchResponse(data=data)
+
+        if not query and not multimodal_query:
+            return await _finish([], reason="empty_query")
         try:
             # Settle an add that was interrupted between the memory append and
             # the metadata update; otherwise its records stay invisible.
@@ -441,20 +592,21 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             state.log.warn(f"recover failed user={request.user_id}: "
                            f"{type(exc).__name__}: {exc}")
         if not store.has_memory():
-            return SearchResponse(data=[])
+            return await _finish([], reason="no_memory")
+        query_images: list[str] = []
+        query_media: list[dict[str, Any]] = []
         if multimodal_query:
             # Retrieval is caption-based: the query image contributes a short
             # caption, and at most one inline image is kept for the bounded
             # gate call.  The base64 never becomes part of the question text.
+            # The image itself is content-addressed, so the same query image
+            # reused across searches costs one file and one caption call.
             query, query_images = await multimodal_mod.query_content(
                 request.query, captioner=state.captioner,
-                config=state.config)
+                config=state.config, image_store=store.image_store,
+                media_out=query_media)
             if not query.strip():
-                return SearchResponse(data=[])
-
-        request_id = (request.request_id or "").strip()
-        limit = (request.top_k if request.top_k is not None
-                 else int(state.config.get("top_k", 100)))
+                return await _finish([], reason="empty_query_after_caption")
 
         # The search writes a model-free coarse shortlist here before its
         # first gate/loop call.  On a hard timeout the route returns that
@@ -537,21 +689,24 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             records = {str(item.get("id")): item for item in raw_records}
             try:
                 data = build_search_items(
-                    items, records, multimodal=multimodal_query, top_k=limit,
-                    media_root=store.images_dir, config=state.config)
+                    items, records, multimodal=response_parts, top_k=limit,
+                    media_root=store.images_dir,
+                    shared_media_root=store.shared_images_dir,
+                    config=state.config)
             except Exception as exc:  # noqa: BLE001 - fallback must not 5xx
                 state.log.warn(
                     f"fallback build failed user={request.user_id}: "
                     f"{type(exc).__name__}: {exc}")
                 data = []
             message = (f"search {reason} user={request.user_id} "
-                       f"request={request_id or '-'} fallback={len(data)}")
+                       f"request={request_id or '-'} fallback={len(data)} "
+                       f"parts={response_parts}")
             if note_error:
                 state.note_error(message)
                 state.log.error(message)
             else:
                 state.log.warn(message)
-            return SearchResponse(data=data)
+            return await _finish(data, reason=reason)
 
         started = time.perf_counter()
         try:
@@ -585,6 +740,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 f"degraded={bool(summary.get('degraded'))} "
                 f"cached={bool(result.get('cached'))} "
                 f"stop={summary.get('stop_reason') or '-'} "
+                f"parts={response_parts} "
+                f"raw={(request_ref or {}).get('sha256', '')[:12] or '-'} "
                 f"seconds={time.perf_counter() - started:.2f}")
 
             try:
@@ -594,9 +751,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             records = {str(item.get("id")): item for item in raw_records}
             data = build_search_items(
                 result.get("evidence") or [], records,
-                multimodal=multimodal_query, top_k=limit,
-                media_root=store.images_dir, config=state.config)
-            return SearchResponse(data=data)
+                multimodal=response_parts, top_k=limit,
+                media_root=store.images_dir,
+                shared_media_root=store.shared_images_dir,
+                config=state.config)
+            return await _finish(data, reason="ok")
         finally:
             if fallback_path is not None and not state.fallback_keep_files:
                 try:
