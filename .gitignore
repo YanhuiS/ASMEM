@@ -19,6 +19,9 @@ archive.tar
 # Generated/local config overrides
 *.used.yaml
 *.local.yaml
+# Live endpoint/key.  Keep the local api.yaml out of git; commit a sanitized
+# api.example.yaml instead if the repo needs a reference config.
+configs/api.yaml
 
 # Comparison-only configs/scripts (kept locally, not part of the core commit)
 configs/ablations/

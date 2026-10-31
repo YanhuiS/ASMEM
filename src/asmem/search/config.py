@@ -150,6 +150,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # dilute coverage more than they help recall.
     "loop_force_intents": [],
     "loop_accept_answer_types": [],
+    # Intents that get one extra evidence-loop turn (aggregation/multi-hop
+    # often need a bridge hop: event -> city/date -> receipts).
+    "loop_extra_step_intents": [],
     # Second, stricter look at an accepted gate answer for single-value/
     # ordering intents.  Catches a quote about a different event; rubric/
     # long-document answers skip it.

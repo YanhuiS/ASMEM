@@ -180,12 +180,33 @@ def _text_model_config(
     return config
 
 
+def _inherit_generator(raw: dict[str, Any],
+                       config_path: Path) -> dict[str, Any]:
+    """Read a generator block from another YAML (``inherit_generator: api.yaml``).
+
+    Keeping the remote endpoint/key in ``configs/api.yaml`` means a benchmark
+    config can reference it without copying the secret into a tracked file.
+    """
+    reference = str(raw.get("inherit_generator") or "").strip()
+    if not reference:
+        return {}
+    parent_path = Path(reference)
+    if not parent_path.is_absolute():
+        parent_path = config_path.parent / parent_path
+    if not parent_path.exists():
+        raise ValueError(f"{config_path}: inherit_generator not found: {parent_path}")
+    parent = yaml.safe_load(parent_path.read_text(encoding="utf-8")) or {}
+    generator = parent.get("generator") if isinstance(parent, dict) else None
+    return copy.deepcopy(generator) if isinstance(generator, dict) else {}
+
+
 def load_bench_config(path: str | Path) -> dict[str, Any]:
     """Load and resolve one experiment YAML."""
     config_path = Path(path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{config_path}: expected a YAML mapping")
+    inherited_generator = _inherit_generator(raw, config_path)
 
     experiment = deep_merge(EXPERIMENT_DEFAULTS, raw.get("experiment") or {})
     experiment["datasets"] = normalize_datasets(experiment.get("datasets"))
@@ -203,6 +224,10 @@ def load_bench_config(path: str | Path) -> dict[str, Any]:
     # The search runner reads the same file. Its defaults + top-level keys are
     # exactly what we want, then we override the client pool size.
     search = runner.load_config(config_path)
+    if inherited_generator:
+        search["generator"] = deep_merge(
+            deep_merge(search.get("generator") or {}, inherited_generator),
+            raw.get("generator") or {})
     search["concurrency"] = experiment["search_concurrency"]
     top_log = raw.get("log") if isinstance(raw.get("log"), dict) else {}
     search["log"] = {
@@ -210,7 +235,7 @@ def load_bench_config(path: str | Path) -> dict[str, Any]:
         "output": top_log.get("output") or "",
     }
 
-    base_generator = dict(raw.get("generator") or {})
+    base_generator = deep_merge(inherited_generator, raw.get("generator") or {})
     answer_generator = _text_model_config(
         base_generator, answer, concurrency=experiment["answer_concurrency"])
     eval_generator = _text_model_config(

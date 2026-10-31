@@ -10,6 +10,9 @@ from typing import Any, Iterable
 METRIC_NAMES = (
     "score", "token_f1", "exact_match", "mcq_exact",
     "judge_correct", "rubric_score",
+    "mem_gallery_score", "image_id_f1", "image_id_exact",
+    "abstention_correct", "yesno_correct",
+    "atm_bench_score", "evidence_id_f1", "evidence_id_exact",
 )
 
 
@@ -93,6 +96,14 @@ def summarize_group(results: list[dict[str, Any]]) -> dict[str, Any]:
         "mcq_exact": _mean(_metric_values(results, "mcq_exact")),
         "judge_correct": _mean(_metric_values(results, "judge_correct")),
         "rubric_score": _mean(_metric_values(results, "rubric_score")),
+        "mem_gallery_score": _mean(_metric_values(results, "mem_gallery_score")),
+        "image_id_f1": _mean(_metric_values(results, "image_id_f1")),
+        "image_id_exact": _mean(_metric_values(results, "image_id_exact")),
+        "abstention_correct": _mean(_metric_values(results, "abstention_correct")),
+        "yesno_correct": _mean(_metric_values(results, "yesno_correct")),
+        "atm_bench_score": _mean(_metric_values(results, "atm_bench_score")),
+        "evidence_id_f1": _mean(_metric_values(results, "evidence_id_f1")),
+        "evidence_id_exact": _mean(_metric_values(results, "evidence_id_exact")),
         "sufficient_rate": _mean(sufficient),
         "avg_steps": _mean(steps),
         "avg_postagent_calls": _mean(postagent_calls),
@@ -179,6 +190,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
     if summary.get("macro_score") is not None:
         lines.append(f"- macro score (per-dataset mean): **{_fmt(summary['macro_score'])}**")
     for key in ("score", "token_f1", "mcq_exact", "judge_correct", "rubric_score",
+                "mem_gallery_score", "image_id_f1", "image_id_exact",
+                "abstention_correct", "yesno_correct",
                 "sufficient_rate", "avg_steps", "avg_search_seconds",
                 "avg_answer_seconds", "avg_eval_seconds", "search_errors",
                 "eval_errors"):
@@ -234,14 +247,41 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
     lines.append("## By dataset / answer type")
     lines.append("")
-    lines.append("| dataset/type | n | score | f1 | mcq | judge | rubric |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
-    for name, item in (summary.get("by_answer_type") or {}).items():
-        lines.append(
-            f"| {name} | {item.get('n', 0)} | {_fmt(item.get('score'))} | "
-            f"{_fmt(item.get('token_f1'))} | {_fmt(item.get('mcq_exact'))} | "
-            f"{_fmt(item.get('judge_correct'))} | {_fmt(item.get('rubric_score'))} |"
-        )
+    by_type = summary.get("by_answer_type") or {}
+    has_atm = any(item.get("atm_bench_score") is not None
+                  for item in by_type.values())
+    has_mem = any(item.get("mem_gallery_score") is not None
+                  for item in by_type.values())
+    if has_atm:
+        lines.append("| dataset/type | n | score | evidence_id_f1 | exact | judge |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for name, item in by_type.items():
+            lines.append(
+                f"| {name} | {item.get('n', 0)} | {_fmt(item.get('score'))} | "
+                f"{_fmt(item.get('evidence_id_f1'))} | "
+                f"{_fmt(item.get('evidence_id_exact'))} | "
+                f"{_fmt(item.get('judge_correct'))} |"
+            )
+    elif has_mem:
+        lines.append("| dataset/type | n | score | img_id_f1 | abstain | yesno | judge |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        for name, item in by_type.items():
+            lines.append(
+                f"| {name} | {item.get('n', 0)} | {_fmt(item.get('score'))} | "
+                f"{_fmt(item.get('image_id_f1'))} | "
+                f"{_fmt(item.get('abstention_correct'))} | "
+                f"{_fmt(item.get('yesno_correct'))} | "
+                f"{_fmt(item.get('judge_correct'))} |"
+            )
+    else:
+        lines.append("| dataset/type | n | score | f1 | mcq | judge | rubric |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        for name, item in by_type.items():
+            lines.append(
+                f"| {name} | {item.get('n', 0)} | {_fmt(item.get('score'))} | "
+                f"{_fmt(item.get('token_f1'))} | {_fmt(item.get('mcq_exact'))} | "
+                f"{_fmt(item.get('judge_correct'))} | {_fmt(item.get('rubric_score'))} |"
+            )
     lines.append("")
     return "\n".join(lines)
 

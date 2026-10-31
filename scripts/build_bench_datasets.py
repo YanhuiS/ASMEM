@@ -36,6 +36,11 @@ Supported datasets
     ScriptMem. The release deliberately omits the source scripts, so this file
     is **search-only**: it has questions and gold MCQ answers but no add
     events. It cannot evaluate memory retrieval, only answer scoring.
+``mem_gallery``
+    Mem-Gallery. One user per scenario. Each session is one add; every image
+    becomes a searchable record with its id (``D1:IMG_003``) and caption, and
+    a QA's query image is represented by its caption. Gold answers may be
+    image ids, text, yes/no, or ``Not mentioned.``
 
 Record shape (one line)::
 
@@ -1542,7 +1547,415 @@ def convert_scriptmem(max_users: int = 0) -> Iterator[dict[str, Any]]:
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Mem-Gallery
+# ---------------------------------------------------------------------------
+#
+# Mem-Gallery is a multimodal multi-session dialogue benchmark: 20 scenarios,
+# ~12 sessions each, and images interleaved with the dialogue.  Every image
+# carries an id (``D1:IMG_003``) and a human caption; every QA carries the
+# dialogue rounds (``clue``) that justify its answer and, when needed, a query
+# image plus its caption.
+#
+# ASMEM retrieves text, so the converter turns the multimodal material into
+# three searchable record families:
+#
+#   1. the user turn          ``[round D1:3] <question>``
+#   2. the assistant turn     ``[round D1:3] <answer> [image: D1:IMG_003]``
+#   3. one record per image   ``[image: D1:IMG_003] [caption] <caption>``
+#
+# A query image is represented by the caption that ships with the QA, exactly
+# as ``multimodal.query_content`` would caption an inline image.  This keeps
+# the retrieval contract text-only (BM25 / dense over captions) while every
+# image still has a stable, citable id.
+
+MEM_GALLERY_DIR = Path(os.environ.get(
+    "MEM_GALLERY_DIR",
+    "/home/minghaifeng/opticalmemory/data/Mem-Gallery"))
+MEM_GALLERY_DIALOG = MEM_GALLERY_DIR / "data" / "dialog"
+MEM_GALLERY_IMAGES = MEM_GALLERY_DIR / "data" / "image"
+
+_MG_IMAGE_ID = re.compile(r"D\d+:IMG_\d+")
+
+
+def _mg_parse_date(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _mg_as_list(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _mg_image_ids(value: Any) -> list[str]:
+    return dedupe(_MG_IMAGE_ID.findall(str(value or "")))
+
+
+def _mg_turn_text(turn: dict[str, Any], role: str) -> str:
+    """One dialogue turn as searchable text, with its round id."""
+    text = str(turn.get(role) or "").strip()
+    round_id = str(turn.get("round") or "").strip()
+    lines = [text] if text else []
+    if role == "assistant":
+        for image_id in _mg_as_list(turn.get("image_id")):
+            image_id = str(image_id).strip()
+            if image_id:
+                lines.append(f"[image: {image_id}]")
+    if round_id:
+        lines.append(f"[round {round_id}]")
+    return "\n".join(line for line in lines if line)
+
+
+def _mg_image_text(turn: dict[str, Any]) -> list[str]:
+    """One searchable record per image: id + caption + round."""
+    ids = _mg_as_list(turn.get("image_id"))
+    captions = _mg_as_list(turn.get("image_caption"))
+    round_id = str(turn.get("round") or "").strip()
+    out: list[str] = []
+    for index, raw_id in enumerate(ids):
+        image_id = str(raw_id).strip()
+        if not image_id:
+            continue
+        caption = str(captions[index]).strip() if index < len(captions) else ""
+        lines = [f"[image: {image_id}]"]
+        if caption:
+            lines.append(f"[caption] {caption}")
+        if round_id:
+            lines.append(f"[round {round_id}]")
+        out.append("\n".join(lines))
+    return out
+
+
+def _mg_answer_variants(answer: str) -> list[str]:
+    """Acceptable gold forms: original, de-punctuated, and reordered ids."""
+    value = str(answer or "").strip()
+    if not value:
+        return []
+    variants = [value]
+    stripped = value.rstrip(".").strip()
+    if stripped and stripped != value:
+        variants.append(stripped)
+    ids = _mg_image_ids(value)
+    if len(ids) > 1:
+        variants.append(", ".join(reversed(ids)))
+    if value.lower().startswith("not mentioned"):
+        variants.extend(["Not mentioned.", "Not mentioned in the dialogue."])
+    return dedupe(variants)
+
+
+def convert_mem_gallery(max_users: int = 0) -> Iterator[dict[str, Any]]:
+    if not MEM_GALLERY_DIALOG.is_dir():
+        raise FileNotFoundError(
+            f"Mem-Gallery not found at {MEM_GALLERY_DIALOG}; set MEM_GALLERY_DIR")
+    paths = sorted(MEM_GALLERY_DIALOG.glob("*.json"))
+    for scenario_index, path in enumerate(paths):
+        if max_users and scenario_index >= max_users:
+            break
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        scenario = path.stem
+        profile = raw.get("character_profile") or {}
+        sessions = raw.get("multi_session_dialogues") or []
+        qas = raw.get("human-annotated QAs") or []
+        user_id = f"mem-gallery-{scenario}"
+
+        builder = UserBuilder(
+            "mem_gallery",
+            user_id,
+            {
+                "source_id": scenario,
+                "scenario": scenario,
+                "scenario_index": scenario_index,
+                "character_profile": profile,
+                "sessions": len(sessions),
+                "qa_count": len(qas),
+                "image_dir": str(MEM_GALLERY_IMAGES / scenario),
+            },
+        )
+
+        # round id -> evidence snapshot for diagnostics / clue alignment
+        round_lookup: dict[str, dict[str, Any]] = {}
+        session_index = 0
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_index += 1
+            session_id = str(session.get("session_id") or f"D{session_index}")
+            date_text = str(session.get("date") or "")
+            moment = _mg_parse_date(date_text)
+            messages: list[dict[str, Any]] = []
+            for turn_position, turn in enumerate(session.get("dialogues") or [], 1):
+                if not isinstance(turn, dict):
+                    continue
+                round_id = str(turn.get("round") or f"{session_id}:{turn_position}")
+                user_text = _mg_turn_text(turn, "user")
+                assistant_text = _mg_turn_text(turn, "assistant")
+                if user_text:
+                    messages.append(make_message(
+                        str(profile.get("name") or "user"), user_text, to_ms(moment)))
+                if assistant_text:
+                    messages.append(make_message("Assistant", assistant_text,
+                                                 to_ms(moment)))
+                images = []
+                for image_text in _mg_image_text(turn):
+                    messages.append(make_message("image", image_text, to_ms(moment)))
+                    image_id = _mg_image_ids(image_text)[0] if _mg_image_ids(image_text) else ""
+                    caption = ""
+                    ids = _mg_as_list(turn.get("image_id"))
+                    captions = _mg_as_list(turn.get("image_caption"))
+                    for index, raw_id in enumerate(ids):
+                        if str(raw_id).strip() == image_id and index < len(captions):
+                            caption = str(captions[index]).strip()
+                            break
+                    images.append({"image_id": image_id, "caption": caption})
+                round_lookup[round_id] = {
+                    "round": round_id,
+                    "session_id": session_id,
+                    "date": date_text,
+                    "user": str(turn.get("user") or "").strip(),
+                    "assistant": str(turn.get("assistant") or "").strip(),
+                    "images": images,
+                }
+            if messages:
+                builder.add(
+                    session_id,
+                    session_index,
+                    messages,
+                    time=iso(moment),
+                    meta={"source_session_date": date_text,
+                          "scenario": scenario},
+                )
+
+        for qa_index, qa in enumerate(qas):
+            if not isinstance(qa, dict):
+                continue
+            question = str(qa.get("question") or "").strip()
+            answer = str(qa.get("answer") or "").strip()
+            if not question or not answer:
+                continue
+            point = str(qa.get("point") or "").strip().upper()
+            caption = str(qa.get("image_caption") or "").strip()
+            query = question
+            if qa.get("question_image") and caption:
+                # A text-only retriever sees the query image through its
+                # caption, the same text the multimodal Add path would derive.
+                query = f"{question}\n\nThe image in the question shows: {caption}"
+            clue = dedupe(
+                str(item).strip() for item in _mg_as_list(qa.get("clue"))
+                if str(item).strip())
+            builder.search(
+                query,
+                query_raw=question,
+                answer=answer,
+                answer_type=point or "unknown",
+                answer_meta={
+                    "point": point,
+                    "clue": clue,
+                    "session_ids": _mg_as_list(qa.get("session_id")),
+                    "question_image": str(qa.get("question_image") or ""),
+                    "question_image_caption": caption,
+                    "scenario": scenario,
+                    "qa_index": qa_index,
+                    "unanswerable": point == "AR",
+                    "acceptable_answers": _mg_answer_variants(answer),
+                    "clue_messages": [
+                        round_lookup[item] for item in clue if item in round_lookup
+                    ],
+                },
+            )
+        yield builder.record()
+
+
+# ---------------------------------------------------------------------------
+# ATM-Bench
+# ---------------------------------------------------------------------------
+#
+# One person's ~4 years of emails, photos and videos.  The release ships
+# captions/OCR for every image and video, so each visual item becomes a text
+# record with a stable source id:
+#
+#   [image: 20220703_210745]  [caption] ...  [tags] ...  [time] ...
+#   [video: 20220502_172850]  [caption] ...  [duration] ...
+#   [email: email202411160004] [summary] ... [detail] ... [time] ...
+#
+# All memory is added first; the 1,013 QAs are searched after it, which lets
+# the benchmark pipeline run one user's searches concurrently.
+
+ATM_BENCH_DIR = Path(os.environ.get(
+    "ATM_BENCH_DIR", "/home/minghaifeng/ASMEM/data/ATM-Bench"))
+ATM_QA = ATM_BENCH_DIR / "data" / "atm-bench" / "atm-bench.json"
+ATM_IMAGES = ATM_BENCH_DIR / "data" / "processed_memory" / "image_batch_results.json"
+ATM_VIDEOS = ATM_BENCH_DIR / "data" / "processed_memory" / "video_batch_results.json"
+ATM_EMAILS = ATM_BENCH_DIR / "data" / "raw_memory" / "email" / "emails.json"
+
+
+def _atm_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    moment: datetime | None = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S+00:00", "%Y-%m-%d"):
+        try:
+            moment = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if moment is None:
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
+def _atm_source_id(path: Any) -> str:
+    return Path(str(path or "")).stem
+
+
+def _atm_tags(record: dict[str, Any]) -> str:
+    tags = record.get("tags")
+    if isinstance(tags, list):
+        return ", ".join(str(item).strip() for item in tags if str(item).strip())
+    return str(tags or "").strip()
+
+
+def _atm_visual_text(kind: str, record: dict[str, Any]) -> str:
+    source_id = _atm_source_id(record.get(f"{kind}_path"))
+    lines = [f"[{kind}: {source_id}]"]
+    caption = str(record.get("caption") or "").strip()
+    short = str(record.get("short_caption") or "").strip()
+    if caption:
+        lines.append(f"[caption] {caption}")
+    if short and short != caption:
+        lines.append(f"[short] {short}")
+    tags = _atm_tags(record)
+    if tags:
+        lines.append(f"[tags] {tags}")
+    ocr = str(record.get("ocr_text") or "").strip()
+    if ocr and "no text" not in ocr.lower():
+        lines.append(f"[ocr] {ocr[:600]}")
+    location = str(record.get("location_name") or "").strip()
+    city = str(record.get("city") or "").strip()
+    if location:
+        lines.append(f"[location] {location}")
+    if city:
+        lines.append(f"[city] {city}")
+    if kind == "video" and record.get("duration_formatted"):
+        lines.append(f"[duration] {record['duration_formatted']}")
+    if record.get("timestamp"):
+        lines.append(f"[time] {record['timestamp']}")
+    return "\n".join(lines)
+
+
+def _atm_email_text(record: dict[str, Any]) -> str:
+    lines = [f"[email: {record.get('id')}]"]
+    summary = str(record.get("short_summary") or "").strip()
+    detail = str(record.get("detail") or "").strip()
+    if summary:
+        lines.append(f"[summary] {summary}")
+    if detail:
+        lines.append(f"[detail] {detail}")
+    if record.get("timestamp"):
+        lines.append(f"[time] {record['timestamp']}")
+    return "\n".join(lines)
+
+
+def convert_atm_bench(max_users: int = 0) -> Iterator[dict[str, Any]]:
+    if not ATM_QA.exists():
+        raise FileNotFoundError(ATM_QA)
+    qas = json.loads(ATM_QA.read_text(encoding="utf-8"))
+    images = json.loads(ATM_IMAGES.read_text(encoding="utf-8")) if ATM_IMAGES.exists() else []
+    videos = json.loads(ATM_VIDEOS.read_text(encoding="utf-8")) if ATM_VIDEOS.exists() else []
+    emails = json.loads(ATM_EMAILS.read_text(encoding="utf-8")) if ATM_EMAILS.exists() else []
+
+    # (moment, role, content)
+    moments: list[tuple[datetime | None, str, str]] = []
+    for record in images:
+        moments.append((_atm_time(record.get("timestamp")), "image",
+                        _atm_visual_text("image", record)))
+    for record in videos:
+        moments.append((_atm_time(record.get("timestamp")), "video",
+                        _atm_visual_text("video", record)))
+    for record in emails:
+        moments.append((_atm_time(record.get("timestamp")), "email",
+                        _atm_email_text(record)))
+    moments.sort(key=lambda item: item[0] or datetime(1970, 1, 1))
+
+    builder = UserBuilder(
+        "atm_bench",
+        "atm-bench-main",
+        {
+            "source_id": "ATM-Bench",
+            "images": len(images),
+            "videos": len(videos),
+            "emails": len(emails),
+            "qa_count": len(qas),
+            "note": "one person's multi-source personal memory",
+        },
+    )
+
+    # One add per calendar month keeps the add stream bounded while preserving
+    # chronology.
+    buckets: dict[str, list[tuple[datetime | None, str, str]]] = {}
+    for moment in moments:
+        key = (moment[0] or datetime(1970, 1, 1)).strftime("%Y-%m")
+        buckets.setdefault(key, []).append(moment)
+    session_index = 0
+    for month in sorted(buckets):
+        session_index += 1
+        messages = [
+            make_message(role, content, to_ms(moment))
+            for moment, role, content in buckets[month]
+            if content.strip()
+        ]
+        if not messages:
+            continue
+        first = buckets[month][0][0]
+        builder.add(
+            f"atm-{month}", session_index, messages,
+            time=iso(first),
+            meta={"month": month, "records": len(messages)},
+        )
+
+    for index, qa in enumerate(qas):
+        if max_users and index >= max_users:
+            break
+        question = str(qa.get("question") or "").strip()
+        answer = qa.get("answer")
+        if isinstance(answer, list):
+            answer = ", ".join(str(item).strip() for item in answer if str(item).strip())
+        answer = str(answer or "").strip()
+        if not question or not answer:
+            continue
+        builder.search(
+            question,
+            query_raw=question,
+            answer=answer,
+            answer_type=str(qa.get("qtype") or "open_end"),
+            answer_meta={
+                "evidence_ids": [str(item) for item in (qa.get("evidence_ids") or [])],
+                "qtype": str(qa.get("qtype") or "open_end"),
+                "question_id": str(qa.get("id") or ""),
+                "notes": str(qa.get("notes") or ""),
+            },
+        )
+    yield builder.record()
+
+
 CONVERTERS = {
+    "atm_bench": convert_atm_bench,
+    "mem_gallery": convert_mem_gallery,
     "longmemeval_oracle": lambda limit: convert_longmemeval("oracle", limit),
     "longmemeval_s": lambda limit: convert_longmemeval("s", limit),
     "longmemeval_m": lambda limit: convert_longmemeval("m", limit),
@@ -1562,6 +1975,8 @@ CONVERTERS = {
 }
 
 DEFAULT_DATASETS = [
+    "atm_bench",
+    "mem_gallery",
     "longmemeval_oracle", "longmemeval_s", "longmemeval_m", "locomo_refined",
     "beam_100k", "beam_500k", "beam_1m", "beam_10m",
     "personamem_32k", "personamem_128k",

@@ -32,6 +32,7 @@ python -m asmem.search --memory data/asmem/alice/memory.jsonl \
     --query "Where did Alice move?"
 
 # 3) HTTP API (/add + /search), same implementation
+cp configs/api_mm.yaml configs/api.yaml   # fill generator.api_key
 python -m asmem.api --config configs/api.yaml --port 8000
 ```
 
@@ -90,7 +91,8 @@ python scripts/run_bench.py --config configs/bench_qwen3_gate_loop.yaml \
 /search -> search.runner.run_question -> api.server.build_search_items
 ```
 
-`configs/api.yaml` and `configs/asmem.yaml` both set the core method:
+`configs/api_mm.yaml` is the committed API template (no key); copy it to the
+gitignored `configs/api.yaml` and fill `generator.api_key`:
 
 ```yaml
 postagent_mode: gate_loop
@@ -109,6 +111,98 @@ pre_audit: false
 Only deployment settings (generator/embedding endpoint, concurrency, store_dir) differ.
 `/search` degrades to the coarse evidence already written on model/endpoint failure; it
 never returns a 5xx.
+
+`configs/api.yaml` is ready for the competition service: 4o-mini generator (vision
+captioning for query images), local Qwen3-Embedding-4B on `:30001`, 200 coarse
+candidates, 96 evidence records, and a bounded multi-hop enhancement.  For
+aggregate/multi-hop intents the loop gets one extra rewrite turn and is told to
+bridge event → city/date → receipts/reservations; when evidence carries
+`[city]`/`[location]` tags, a deterministic `<city> <month> <year> receipt invoice
+reservation confirmation` search is appended automatically.
+
+## Multimodal: Mem-Gallery
+
+Mem-Gallery is 20 multi-session scenarios with dialogue images and 1,711 QAs.  The
+dataset ships an id and a human caption per image, so retrieval stays text-only:
+
+```bash
+# external dataset path (defaults to /home/minghaifeng/opticalmemory/data/Mem-Gallery)
+python scripts/build_bench_datasets.py --datasets mem_gallery --overwrite
+python scripts/run_bench.py --config configs/bench_mem_gallery_4omini_final.yaml \
+    --run-name mg4o_final_full_v2 --overwrite
+```
+
+The converter writes one record per image (`[image: D1:IMG_003]` + `[caption] ...` +
+`[round D1:3]`), and a QA's query image is represented by its caption.  The answer
+stage routes by question shape: image ids are selected by evidence number (not
+free-written), conflict questions ask whether memory affirms or denies the claim,
+temporal questions use the `[resolved: ...]` annotations, and before/after questions
+compare round ids.  See [docs/core.md](docs/core.md) §3.5.1.
+
+`bench_mem_gallery_4omini_final.yaml` inherits its generator from
+`configs/api.yaml` (so the key stays in one file) and sets
+`answer.media.enabled: true`: the answer model receives the query image and up
+to `max_images` memory images referenced by the final evidence, with per-type
+image policies.  The caption-only A/B was run with a local variant that disables
+`answer.media`.
+
+400-query validation subset (the first 20 QAs of each scenario; same search index):
+
+| method | score | VS | TTL | VR | CD | TR |
+|---|---:|---:|---:|---:|---:|---:|
+| direct answer (no type routing) | 0.7239 | 0.543 | 0.619 | 0.556 | 0.360 | 0.686 |
+| typed answer routing | **0.8052** | 0.804 | 0.714 | 0.556 | 0.960 | 0.800 |
+
+4o-mini A/B on the same 400 queries (same search/judge, only answer images change):
+
+| answer input | score | TTL | VS | VR |
+|---|---:|---:|---:|---:|
+| captions only | 0.7628 | 0.762 | 0.819 | 0.667 |
+| + query/memory images | 0.7789 | 0.786 | 0.825 | 0.667 |
+| + per-type image policy + counting path | **0.7995** | **0.881** | 0.814 | **0.750** |
+
+Image-question failure attribution: most failures are the model picking the wrong
+image even though the gold image is in the evidence; retrieval misses are rare. The
+final config therefore uses per-type image policies (VS low/3, TTL/VR/KR high/5) and
+leaves text questions image-free. See [docs/core.md](docs/core.md) §5.2.
+
+Full Mem-Gallery (1,711 QAs, 4o-mini, final config): **0.7455**.  Per type: VS 0.772,
+TTL 0.783, VR 0.568, FR 0.744, MR 0.830, TR 0.764, CD 0.778, AR 0.739, KR 0.611.
+The controlled 400-query A/B is the cleaner image contribution (0.7628 -> 0.7995);
+the full set is harder.  The main limitation is answer-side visual selection, not
+retrieval; a hybrid text-Qwen3 / image-4o-mini answerer is the next step.
+
+## ATM-Bench
+
+One person's ~4 years of 6,742 emails, 3,759 photos and 533 videos, with
+1,013 evidence-grounded QAs.  The release ships captions/OCR for every visual
+item, so the converter builds one text record per source with a stable id:
+
+```text
+[email: email202411160004] [summary] ... [detail] ... [time] ...
+[image: 20220703_210745]   [caption] ... [tags] ... [location] ... [time] ...
+[video: 20220502_172850]   [caption] ... [duration] ... [time] ...
+```
+
+All memory is added first (one add per calendar month), then the 1,013
+searches run concurrently.  Photos are attached to `open_end`/`list_recall`
+answers; number questions stay text-only.
+
+```bash
+python scripts/build_bench_datasets.py --datasets atm_bench --overwrite
+python scripts/run_bench.py --config configs/bench_atm_bench_4omini.yaml \
+    --run-name atm4o_full --overwrite
+python scripts/analyze_atm_bench.py \
+    --predictions data/bench_runs/atm4o_full/predictions.jsonl
+```
+
+`analyze_atm_bench.py` reports answer score **and** evidence-id recall
+(hit-any / full / first-hit rank), because ATM-Bench is evidence-grounded.
+
+Full 1,013 QAs (4o-mini): **0.6557** — list_recall 0.423 (id-set F1), number
+0.750, open_end 0.653.  Evidence hit-any is 0.928 and full recall 0.880, with a
+median first-hit rank of 1: retrieval is strong; the remaining gaps are
+list-id precision, multi-hop number questions, and open-ended answer matching.
 
 ## Results
 
@@ -157,12 +251,10 @@ src/asmem/
   api/          FastAPI /add + /search
   bench/        replay -> answer -> eval benchmark pipeline
 configs/
-  api.yaml                  HTTP API (core method)
-  asmem.yaml                general add/search/API config (core method)
-  bench_qwen3_gate_loop.yaml   full benchmark (core method)
-  bench_4omini_gate_loop.yaml  full benchmark with 4o-mini
-  bench_qwen3_gate_loop_fix200.yaml  214-query validation
-  ablations/                comparison configs (not part of the core commit)
+  api_mm.yaml               HTTP API template (no key; copy to api.yaml)
+  api.yaml                  local filled copy (gitignored)
+  bench_mem_gallery_4omini_final.yaml  Mem-Gallery, per-type images
+  bench_atm_bench_4omini.yaml          ATM-Bench emails/photos/videos
 docs/
   core.md, add.md, search.md
 scripts/
@@ -176,6 +268,7 @@ scripts/
 python scripts/test_evidence_loop.py     # gate checks + evidence loop (CPU only)
 python scripts/test_retrieval.py  # coarse / chunk / neighbours / comparison loop
 python scripts/test_bench.py      # benchmark pipeline (no model calls)
+python scripts/test_multimodal.py # captions, image assets, bounded responses
 python scripts/test_asmem.py      # add / store / API contracts
 ```
 

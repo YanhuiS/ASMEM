@@ -1028,6 +1028,58 @@ class Experiment:
         return self._is_complete(
             cached, require_eval=self.eval_required and has_gold)
 
+    def _answer_media(self, dataset: str,
+                      event: dict[str, Any]) -> dict[str, Any] | None:
+        """Resolve the real image paths for one Mem-Gallery answer.
+
+        Only the answer model receives memory images; the search agent stays
+        caption-based.  A missing image is not an error: the caption remains
+        the evidence.
+        """
+        config = (self.config.get("answer") or {}).get("media") or {}
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return None
+        datasets = config.get("datasets")
+        if datasets and dataset not in datasets:
+            return None
+        answer_type = str(event.get("answer_type") or "").upper()
+        answer_types = config.get("answer_types")
+        if answer_types:
+            wanted = {str(item).upper() for item in answer_types}
+            if answer_type not in wanted:
+                return None
+        overrides = config.get("by_type") or {}
+        if isinstance(overrides, dict):
+            for key, value in overrides.items():
+                if str(key).upper() == answer_type and isinstance(value, dict):
+                    config = {**config, **value}
+                    break
+        image_root = str(config.get("image_root") or "").strip()
+        if not image_root:
+            return None
+        meta = event.get("answer_meta") or {}
+        scenario = str(meta.get("scenario") or "").strip()
+        root = project_path(image_root)
+        if scenario:
+            root = root / scenario
+        if not root.is_dir():
+            return None
+        query_path = ""
+        question_image = str(meta.get("question_image") or "").strip()
+        dialog_root = str(config.get("dialog_root") or "").strip()
+        if question_image and dialog_root:
+            candidate = (project_path(dialog_root) / question_image).resolve()
+            if candidate.is_file():
+                query_path = str(candidate)
+        return {
+            "image_root": str(root),
+            "query_image": query_path,
+            "max_images": int(config.get("max_images", 3) or 3),
+            "max_edge": int(config.get("max_edge", 512) or 512),
+            "query_detail": str(config.get("query_detail") or "high"),
+            "evidence_detail": str(config.get("evidence_detail") or "low"),
+        }
+
     @staticmethod
     def _attach_record_times(evidence: list[dict[str, Any]],
                              records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1128,6 +1180,7 @@ class Experiment:
             return
 
         query = str(event.get("query") or "")
+        media = self._answer_media(dataset, event)
         gold = {
             "answer": event.get("answer"),
             "answer_type": event.get("answer_type"),
@@ -1169,7 +1222,8 @@ class Experiment:
                 async with self.answer_sem:
                     started = time.perf_counter()
                     call = answerer.answer(
-                        dataset=dataset, question=query, evidence=evidence, gold=gold)
+                        dataset=dataset, question=query, evidence=evidence,
+                        gold=gold, media=media)
                     try:
                         result = await asyncio.wait_for(
                             call, timeout=answer_budget + 30 if answer_budget > 0 else None)
@@ -1192,7 +1246,7 @@ class Experiment:
                     esc_started = time.perf_counter()
                     esc_call = self.escalation_answerer.answer(
                         dataset=dataset, question=query, evidence=evidence,
-                        gold=gold)
+                        gold=gold, media=media)
                     try:
                         esc_result = await asyncio.wait_for(
                             esc_call,

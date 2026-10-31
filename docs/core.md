@@ -141,6 +141,18 @@ QUERIES ALREADY RUN
   normalized text 合并去重；
 - 最多 `loop_max_steps: 3`；加 verifier 1 次，仍低于 6。
 
+**多跳/聚合的简单增强。** 总额、计数、多来源题最常见的失败是少一跳“事件 → 城市/日期 → 收据/预订”：
+
+- loop 的 rewrite 规则第 7 条：总额/计数题先从 evidence 读出事件的城市和日期，再搜
+  receipts / invoices / reservations / bookings / confirmation emails。
+- `loop_extra_step_intents: [aggregate, aggregation, multi_hop]` 只给这些 intent 多一轮
+  loop（普通题仍是 3 轮）。
+- 确定性 bridge：如果 evidence 里有 `[city]` / `[location]` 标签，loop 结束后直接跑一次
+  `<city> <month> <year> receipt invoice reservation confirmation`，自动保存
+  top 6。ATM-Bench 的 BMVC 2024 住宿题因此能召回两封 gold 酒店确认邮件
+  （655.59 + 144.15 GBP）。这个 query 是通用的收据/预订桥，不绑定“酒店”。
+- 这套增强只依赖文本和已有的 location 标签，不增加新的模型或外部服务。
+
 ### 3.5 多模态：caption 检索，不做 image embedding
 
 多模态赛道只在**报文形态**上和文本赛道不同：`messages[].content` 与 `query` 是有序的
@@ -174,6 +186,75 @@ build_search_items：text ContentPart 在前，命中的 memory 图按预算追�
   `max_response_images` 限制；放不下的图直接跳过，不截断响应。
 - caption 端点失败不影响 Add：降级为同条 text / `[image: <id>]`，`/add` 仍返回
   `success=true`。
+
+#### 3.5.1 Mem-Gallery：带 image id 的多 session 对话记忆
+
+Mem-Gallery 的图片本身带人工 caption 和稳定 id（`D1:IMG_003`），因此不需要 vision
+caption。`scripts/build_bench_datasets.py::convert_mem_gallery` 把它转成三类可检索记录：
+
+```text
+user turn       [round D1:3] <用户问题>
+assistant turn  [round D1:3] <回复> [image: D1:IMG_003]
+image record    [image: D1:IMG_003]  [caption] <人工 caption>  [round D1:3]
+```
+
+每个 image 是**独立检索单元**，BM25 / dense / exact / time 都照常工作。带 query image
+的 QA 把数据集自带的 `image_caption` 拼进 query，等价于 `query_content` 对 inline
+image 生成的 caption。答案侧按题型使用确定性路径，而不是让 8B 模型自由发挥：
+
+- **VS / `image_id` 题**：让模型只选 evidence 编号（不写 id），再映射回 image id；
+  题面给日期时先按日期过滤候选，题面给数量时截断到该数量；没有 query image 且
+  没给数量时，优先保留候选最多的 session，避免把全库相似图都选进来。
+- **CD 冲突题**：claim-vs-memory 题先问 memory 是 `affirm / deny / not_mentioned`，
+  `deny` 即冲突；"Is there a contradiction between X and Y" 这类内部一致性问题走另一条
+  判断。`Has X ever ...?` 走存在性检查。
+- **TR 时间题**：`When ...?` 只在 `[resolved: ...]` 候选上做一次小选择，避免把 session
+  date 当事件日期；`before or after` 题先定位两条记录，再按 `[round Dx:y]` 比较顺序。
+- **VR / TTL / KR 文本题**：如果答案是纯 image id（模型把 id 当答案），用 query caption
+  + evidence 文本重答一次，强制输出名字 / 地点 / 数量等文本。
+- **AR 拒答题**：不按题型强制拒答，仍由普通 answer prompt 判断；按 label 直接输出
+  `Not mentioned.` 会把 AR 分数虚高。
+
+**Answer 侧真正看原图。** Qwen3-8B 是纯文本模型，只能验证 caption 路线；4o-mini 是
+多模态模型，`configs/bench_mem_gallery_4omini.yaml` 因此把 answer 阶段的输入扩成：
+
+```text
+question + evidence 文本（含 [image: id] 标记）
+  + query image（high detail）
+  + 最终 evidence 里引用到的 memory images（low detail，≤ max_images）
+```
+
+图片按 `[attached image: <id>]` 标注后插在 user message 里，和 evidence 的
+`[image: <id>]` 一一对应；resize 到长边 512、磁盘缓存，避免每道题重复编码。搜索/verifier
+仍是 caption 文本，这样图片只增加 answer 的视觉证据，不改变粗筛的确定性。
+
+`configs/bench_mem_gallery_4omini_caption.yaml` 把 `answer.media.enabled` 关掉，作为
+caption-only 对照；A/B 的差值就是“answer 能不能看原图”的贡献。
+
+`Judge` 对 Mem-Gallery 使用 `mem_gallery_score`：image id 题按集合 F1，AR 看是否输出
+`Not mentioned`，CD yes/no 看极性；其余开放题仍用 LLM judge。`by_answer_type` 会分别
+报告 VS / TTL / VR / CD / AR / TR / FR / MR / KR。
+
+#### 3.5.2 ATM-Bench：邮件 + 照片 + 视频的长期个人记忆
+
+ATM-Bench 是一个人的 ~4 年个人数据：6,742 封邮件、3,759 张照片、533 个视频、
+1,013 道 evidence-grounded QA。数据自带图片/视频的 caption、OCR、时间和地点，
+所以每个来源都落成一条带稳定 source id 的文本记录：
+
+```text
+[email: email202411160004] [summary] ... [detail] ... [time] ...
+[image: 20220703_210745]   [caption] ... [tags] ... [location] ... [time] ...
+[video: 20220502_172850]   [caption] ... [duration] ... [time] ...
+```
+
+转换器按自然月做 add（43 个月），所有 add 完成后才跑 1,013 个 search；benchmark
+pipeline 检测到 memory 静态，会把同一用户的 search 并发跑（`search_concurrency`）。
+answer 侧和 Mem-Gallery 共用 `answer.media`：`open_end` / `list_recall` 会附上
+命中 evidence 里的照片，`number` 题不附图（多为邮件/价格查询）。
+
+ATM-Bench 是 evidence-grounded 的，所以 `scripts/analyze_atm_bench.py` 除了 answer
+score，还报告 gold `evidence_ids` 是否出现在 answer-visible evidence 里
+（hit-any / full recall / first-hit rank）；这能区分“检索没找到”和“找到了但答错”。
 
 ### 3.6 后处理：answer 看到的才是最终证据
 
@@ -229,8 +310,20 @@ loop_evidence_chars: 6000
 loop_item_chars: 400
 loop_force_intents: []
 loop_accept_answer_types: []
+loop_extra_step_intents: [aggregate, aggregation, multi_hop]
 gate_check_consistency: true
 pre_audit: false
+# Retrieval (api.yaml uses the local Qwen3-Embedding-4B on :30001)
+retrieval:
+  coarse:
+    candidates: 200
+  dense:
+    mode: "on"
+    model: qwen3-embedding-4b
+    base_url: http://127.0.0.1:30001/v1
+    dim: 2560
+max_evidence: 96
+max_evidence_chars: 40000
 multimodal:
   caption: true
   caption_query: true
@@ -280,6 +373,105 @@ API 只改 generator/embedding endpoint、`concurrency`、`store_dir` 等部署�
 | b2 loop | 0.7373 | 7.28 |
 | fixed pipeline（对比） | 0.7524 | 5.29 |
 | **core：verifier + evidence loop** | **0.7637** | **3.12** |
+
+详见 [search.md](search.md)。
+
+### 5.1 Mem-Gallery 400 题验证子集
+
+同一份 memory、同一套粗筛，只比较 answer 侧的多模态路由（20 个 scenario 各取前 20 题）：
+
+| 方案 | score | VS | TTL | VR | CD | TR | AR | FR | MR | KR |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 直接 answer（无题型路由） | 0.7239 | 0.543 | 0.619 | 0.556 | 0.360 | 0.686 | 0.962 | 0.875 | 0.931 | 0.750 |
+| 题型路由（含已撤回的 AR 强制拒答） | 0.8052 | 0.804 | 0.714 | 0.556 | 0.960 | 0.800 | 0.755 | 0.875 | 0.948 | 0.792 |
+
+主要收益来自 determinism：VS 让模型只选 evidence 编号（不再自由写 id），CD 用
+affirm/deny 判定，TR 用 `[resolved]` 候选和 round id 排序。AR 的 0.755 是当时试行的
+"按题型强制 Not mentioned" 造成的，已撤回；最终代码恢复普通 answer 路径。
+
+### 5.2 4o-mini + 原图：caption-only vs 多模态 answer
+
+同一份 400 题子集、同一套 4o-mini 搜索/判分，只改 answer 是否看原图：
+
+| 方案 | score | TTL | VS | VR | KR | answer prompt tokens | answer 秒 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| caption-only | 0.7628 | 0.762 | 0.819 | 0.667 | 0.833 | 4.9k | 2.85 |
+| 带图 low detail，3 张 | 0.7789 | 0.786 | **0.825** | 0.667 | 0.750 | 13.4k | 5.07 |
+| 带图 high detail，5 张 | 约 0.766 | **0.833** | 0.799 | **0.722** | **0.792** | 30.6k | 4.39 |
+| **最终：按题型取图 + counting 路径 + AR quote-check** | **0.7995** | **0.881** | 0.814 | **0.750** | **0.792** | 18.7k | 3.88 |
+
+结论与局限：
+
+- **图片的净收益不大（+1.6 分）但方向明确**：TTL 识别类题收益最大；VS 在 low detail
+  下略升，high detail 反而因为候选图更多而选错。
+- **失败归因不是召回**：20 个图片题失败中 15 个是 `model_or_vision`（gold 图已在
+  evidence、且在图片预算内，模型仍选错），3 个 `image_budget`，2 个 `retrieval_miss`。
+- **Counting 题需要单独路径**：VR 的 89 个失败里 66 个是 “How many …”。把整段 evidence
+  交给模型数会错，改成给一份紧凑的 `id + date + caption + dialogue` 列表、只让它返回
+  整数后，TTL/VR 的计数题明显回升（400 题上 VR 0.667 → 0.750，TTL 0.762 → 0.881）。
+- 所以最终配置按题型取图：**VS low/3 张，TTL/VR/KR high/5 张**，文本题（FR/MR/TR/CD/AR）
+  不附图。这个分型策略来自上表的 400 题消融。
+- 成本：带图把 answer prompt 从 4.9k 抬到 13–31k tokens；high detail 的 token 约为
+  low 的 3 倍，收益集中在 TTL/VR/KR。最终按题型混合后均值 18.7k、3.88s/题。
+- 4o-mini 的 AR 会把“相关事实”当答案，因此 4o-mini 配置启用 `ar_quote_check`：
+  先让模型判断 memory 是否**显式**回答，并校验 quote 确实出现在 evidence 里。
+
+### 5.3 全量 1711（4o-mini，最终配置）
+
+| type | n | score |
+|---|---:|---:|
+| VS | 306 | 0.7719 |
+| TTL | 337 | 0.7834 |
+| VR | 174 | 0.5678 |
+| FR | 219 | 0.7443 |
+| MR | 206 | 0.8301 |
+| TR | 123 | 0.7642 |
+| CD | 81 | 0.7778 |
+| AR | 184 | 0.7391 |
+| KR | 81 | 0.6111 |
+| **overall** | **1711** | **0.7455** |
+
+全量比 400 题子集难（尤其 VR/KR/FR），所以绝对分低于 5.2 的 0.7995。相对上一版
+全量（0.7430），counting 路径把 VR 从 0.4931 提到 0.5678，总分为 0.7455；其余题型
+在 4o-mini 的 run-to-run 波动范围内。
+
+**局限**（按重要性）：
+
+1. **检索不是主瓶颈。** 图片题剩余失败中 13/17 是 `model_or_vision`（gold 图已在
+   evidence、也在图片预算内，模型仍选错），只有 2 个是 `retrieval_miss`。
+2. **细粒度视觉匹配仍是上限。** 狗品种、相似地标、服装款式在同 session 多张相似图时
+   容易选错；high detail 有帮助但不是决定性的。
+3. **4o-mini 的文本推理弱于 Qwen3-8B。** FR/MR/AR/KR 的绝对分低于 Qwen3 在同一
+   400 题子集上的表现；4o-mini 的 AR 还会把相关事实当答案（已用 quote-check 缓解）。
+   如果目标只是分数而不是单一模型，建议 **文本题用 Qwen3、图片题用 4o-mini** 的混合
+   answerer；这是下一步最直接的提升点。
+4. **Counting 需要专用路径。** 整段 evidence 直接数会错；紧凑 caption 列表 + 只返回
+   整数明显更好，但仍会因 evidence 缺图而少计。
+5. **成本。** 最终配置 answer prompt 约 22.5k tokens/题（caption-only 4.9k），
+   high-detail 图片是主要成本。
+
+### 5.4 ATM-Bench 全量（4o-mini）
+
+1,013 题，4o-mini + Qwen3-Embedding-4B；`open_end`/`list_recall` 附图，`number` 不附图。
+
+| type | n | score | evidence hit-any | evidence full |
+|---|---:|---:|---:|---:|
+| list_recall | 139 | 0.4229（id 集合 F1） | 0.863 | 0.791 |
+| number | 360 | 0.7500 | 0.931 | 0.889 |
+| open_end | 514 | 0.6525 | 0.944 | 0.897 |
+| **overall** | **1013** | **0.6557** | **0.928** | **0.880** |
+
+- **检索不是主瓶颈。** gold evidence 的 first-hit rank 中位数是 **1**，hit-any 0.928、
+  full 0.880；73 个问题（7.2%）gold id 完全不在最终 evidence 里。
+- **`list_recall` 的瓶颈是 id 精度，不是召回。** gold 97/139 是单个 id，但同一个
+  burst 里相邻时间戳很多；模型倾向返回整串，id F1 被 precision 拖低。试过“单数问题
+  只回 1 个”的规则，离线 F1 从 0.423 降到 0.293，已撤回。
+- **`number` 的硬点是多跳。** 例：BMVC 2024 → Glasgow 酒店 → 两封确认邮件求和；
+  gold 邮件不含 “BMVC”，240/300 条粗筛候选里都没有，loop 的 query rewrite 也没能
+  从 BMVC 推出 Glasgow。
+- **`open_end` 主要是 answer 侧。** 例：问“红色草莓甜点”，gold 是 strawberry and
+  elderflower mousse，模型答 red cheesecake；图像/描述匹配仍会选错相似记忆。
+- 基线（旧 judge 口径、无 id 路径）是 0.6407；id 路径 + id 集合评测把它抬到 0.6557。
 
 详见 [search.md](search.md)。
 

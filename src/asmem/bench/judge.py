@@ -38,6 +38,18 @@ _REFUSAL_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+#: Mem-Gallery answers a visual question with an image id (``D1:IMG_003``).
+#: Comparing those ids as sets is exact and avoids paying a judge call for a
+#: string match the benchmark defines deterministically.
+_MEM_IMAGE_ID_RE = re.compile(r"D\d+:IMG_\d+", re.IGNORECASE)
+#: ATM-Bench list_recall gold is a list of evidence ids: an email id or a
+#: media timestamp (``20240222_092257``).
+_ATM_ID_RE = re.compile(r"\b(?:email\d+|\d{8}_\d{6})\b", re.IGNORECASE)
+_MEM_ABSTAIN_RE = re.compile(
+    r"\b(?:not\s+mentioned|no\s+information|not\s+specified|"
+    r"not\s+provided|cannot\s+be\s+determined|unable\s+to\s+determine)\b",
+    re.IGNORECASE)
+
 #: Gold answers that themselves say the question is unanswerable. A refusal
 #: from the answerer can be correct for these.
 _GOLD_UNANSWERABLE_RE = re.compile(
@@ -256,6 +268,57 @@ class Judge:
         judge_raw = ""
         rubric_raw = ""
 
+        # Mem-Gallery has three deterministic answer contracts: image-id
+        # answers, abstention (``Not mentioned.``), and yes/no conflict
+        # questions.  Score them exactly; only open-ended answers need the
+        # judge.  ``mem_gallery_score`` is the primary metric for that dataset.
+        mem_gallery = dataset == "mem_gallery"
+        mem_point = str(answer_meta.get("point") or "").upper()
+        gold_ids = list(dict.fromkeys(
+            match.upper() for match in _MEM_IMAGE_ID_RE.findall(answer)))
+        if mem_gallery and gold_ids:
+            pred_ids = list(dict.fromkeys(
+                match.upper() for match in _MEM_IMAGE_ID_RE.findall(predicted)))
+            gold_set, pred_set = set(gold_ids), set(pred_ids)
+            overlap = len(gold_set & pred_set)
+            precision = overlap / len(pred_set) if pred_set else 0.0
+            recall = overlap / len(gold_set) if gold_set else 0.0
+            f1 = (2 * precision * recall / (precision + recall)
+                  if precision + recall else 0.0)
+            metrics["image_id_f1"] = f1
+            metrics["image_id_exact"] = 1.0 if gold_set == pred_set else 0.0
+            metrics["image_id_gold"] = gold_ids
+            metrics["image_id_pred"] = pred_ids
+        if mem_gallery and (mem_point == "AR"
+                            or gold_is_unanswerable(answer, answer_meta)):
+            abstained = bool(_MEM_ABSTAIN_RE.search(predicted or "")
+                             or looks_like_refusal(predicted))
+            metrics["abstention_correct"] = 1.0 if abstained else 0.0
+        gold_norm = normalize_text(answer)
+        if mem_gallery and gold_norm in {"yes", "no"}:
+            pred_norm = normalize_text(predicted)
+            chose = (pred_norm == gold_norm
+                     or pred_norm.startswith(gold_norm + " ")
+                     or f" {gold_norm} " in f" {pred_norm} ")
+            metrics["yesno_correct"] = 1.0 if chose else 0.0
+
+        atm_bench = dataset == "atm_bench"
+        atm_ids = list(dict.fromkeys(
+            match.lower() for match in _ATM_ID_RE.findall(answer)))
+        if atm_bench and atm_ids:
+            pred_ids = list(dict.fromkeys(
+                match.lower() for match in _ATM_ID_RE.findall(predicted)))
+            gold_set, pred_set = set(atm_ids), set(pred_ids)
+            overlap = len(gold_set & pred_set)
+            precision = overlap / len(pred_set) if pred_set else 0.0
+            recall = overlap / len(gold_set) if gold_set else 0.0
+            f1 = (2 * precision * recall / (precision + recall)
+                  if precision + recall else 0.0)
+            metrics["evidence_id_f1"] = f1
+            metrics["evidence_id_exact"] = 1.0 if gold_set == pred_set else 0.0
+            metrics["evidence_id_gold"] = atm_ids
+            metrics["evidence_id_pred"] = pred_ids
+
         if answer and not letters:
             # For MCQ, comparing the full option text as a free-form answer is
             # misleading; the primary metric is mcq_exact.
@@ -293,7 +356,11 @@ class Judge:
                 "errors": [], "judge_raw": "", "rubric_raw": "",
             }
 
-        if mode == "judge" and answer:
+        if atm_bench and atm_ids:
+            # The gold is an evidence-id set; a set comparison is exact and
+            # avoids paying a judge call for a string match.
+            metrics["judge_correct"] = metrics["evidence_id_f1"]
+        elif mode == "judge" and answer:
             if not predicted.strip():
                 metrics["judge_correct"] = 0.0
             elif (looks_like_refusal(predicted)
@@ -345,6 +412,26 @@ class Judge:
                     metrics["rubric_score"] = None
                     metrics["rubric_total"] = len(used)
 
+        if mem_gallery:
+            if "image_id_f1" in metrics:
+                metrics["mem_gallery_score"] = metrics["image_id_f1"]
+            elif "abstention_correct" in metrics:
+                metrics["mem_gallery_score"] = metrics["abstention_correct"]
+            elif "yesno_correct" in metrics:
+                metrics["mem_gallery_score"] = metrics["yesno_correct"]
+            elif metrics.get("judge_correct") is not None:
+                metrics["mem_gallery_score"] = metrics["judge_correct"]
+            else:
+                metrics["mem_gallery_score"] = metrics.get("token_f1")
+
+        if atm_bench:
+            if "evidence_id_f1" in metrics:
+                metrics["atm_bench_score"] = metrics["evidence_id_f1"]
+            elif metrics.get("judge_correct") is not None:
+                metrics["atm_bench_score"] = metrics["judge_correct"]
+            else:
+                metrics["atm_bench_score"] = metrics.get("token_f1")
+
         primary = self._primary(dataset, metrics, mode)
         score = metrics.get(primary)
         if score is None:
@@ -364,6 +451,10 @@ class Judge:
         override = (self.config.get("primary_by_dataset") or {}).get(dataset)
         if override:
             return str(override)
+        if dataset == "mem_gallery" and "mem_gallery_score" in metrics:
+            return "mem_gallery_score"
+        if dataset == "atm_bench" and "atm_bench_score" in metrics:
+            return "atm_bench_score"
         if mode == "mcq" or "mcq_exact" in metrics:
             return "mcq_exact"
         if mode == "rubric" or "rubric_score" in metrics:
