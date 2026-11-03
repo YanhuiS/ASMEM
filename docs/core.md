@@ -326,6 +326,11 @@ score，还报告 gold `evidence_ids` 是否出现在 answer-visible evidence �
   BM25/exact/time/state 生成短候选，不调用生成式或 embedding 模型。
 - **dense 超时不再清空候选。** 粗筛 dense 超时会再用 BM25-only 跑一次
   （`_bm25_only_config`），避免 `evidence=0`。
+- **embedding 失败可选升级为致命错误。** 默认 `retrieval.dense.fatal_on_error: false`，
+  dense 端点故障只记 `coarse.warnings` 并降级为 BM25。设为 `true` 后，embedding
+  调用失败（例如百炼欠费返回 `403 AccessDenied.Unpurchased`）会抛 `EmbeddingError`，
+  穿过 coarse 的 BM25 兜底：`/search` 返回 503，随后进程发送 SIGTERM 优雅退出
+  （兜底 30s 未退出则 `os._exit(1)`），不再静默返回低质量结果。
 - **只有带 `request_id` 的请求才在客户端断开后继续运行**；无 `request_id` 的请求被取消，
   立即释放 `search_sem`，避免僵尸任务占满并发。
 - **进程级 endpoint breaker**：`llm_global_breaker_failures > 0` 时，端点连续失败会打开
@@ -377,6 +382,7 @@ retrieval:
     model: qwen3-embedding-4b
     base_url: http://127.0.0.1:30001/v1
     dim: 2560
+    fatal_on_error: false     # true: embedding 失败即终止服务，不降级为 BM25
 max_evidence: 96
 max_evidence_chars: 40000
 multimodal:

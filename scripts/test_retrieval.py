@@ -19,7 +19,9 @@ from asmem.io import write_jsonl  # noqa: E402
 from asmem.retrieval.coarse import run_coarse  # noqa: E402
 from asmem import llm  # noqa: E402
 from asmem.bench.report import summarize_group  # noqa: E402
-from asmem.retrieval.dense import EmbeddingCache, HashingEmbedder  # noqa: E402
+from asmem.retrieval.dense import (  # noqa: E402
+    EmbeddingCache, EmbeddingError, HashingEmbedder,
+)
 from asmem.retrieval.gate import evaluate_gate  # noqa: E402
 from asmem.retrieval.index import build_index  # noqa: E402
 from asmem.retrieval.parents import (  # noqa: E402
@@ -191,6 +193,73 @@ def test_embedding_cache() -> None:
         assert all(abs(a - b) < 1e-6 for a, b in zip(got, [0.1, 0.2, 0.3]))
         assert again.get("missing") is None
         again.close()
+
+
+async def test_embedding_fatal_on_error() -> None:
+    from asmem.retrieval import index as index_mod
+
+    class FailingEmbedder:
+        identity = "failing:v1"
+        usage: dict = {}
+
+        def usage_snapshot(self) -> dict:
+            return {}
+
+        async def embed(self, texts, *, kind="document", usage_out=None):
+            raise RuntimeError(
+                "PermissionDeniedError: 403 AccessDenied.Unpurchased")
+
+        async def aclose(self) -> None:
+            return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        memory = root / "memory.jsonl"
+        write_jsonl(memory, _cache_records())
+        original = index_mod.build_embedder
+        index_mod.build_embedder = lambda cfg: FailingEmbedder()
+        try:
+            soft = await build_index(
+                memory,
+                {"retrieval": {"dense": {"mode": "on", "fatal_on_error": False}}},
+                cache_dir=root / "soft")
+            assert soft.dense_error and not soft.dense_enabled
+            assert "AccessDenied" in soft.dense_error
+
+            try:
+                await build_index(
+                    memory,
+                    {"retrieval": {"dense": {"mode": "on",
+                                             "fatal_on_error": True}}},
+                    cache_dir=root / "fatal")
+            except EmbeddingError as exc:
+                assert "AccessDenied" in str(exc)
+            else:
+                raise AssertionError("fatal embedding failure did not raise")
+        finally:
+            index_mod.build_embedder = original
+
+
+async def test_coarse_fatal_embedding_not_swallowed() -> None:
+    from asmem.search import pipeline
+
+    async def boom(*args, **kwargs):
+        raise EmbeddingError("403 AccessDenied.Unpurchased")
+
+    original = pipeline.run_coarse
+    pipeline.run_coarse = boom
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                await pipeline._coarse_or_empty(
+                    Path(tmp) / "memory.jsonl", "q", [], {}, Path(tmp))
+            except EmbeddingError:
+                pass
+            else:
+                raise AssertionError(
+                    "coarse fallback swallowed the embedding error")
+    finally:
+        pipeline.run_coarse = original
 
 
 async def test_bm25_and_coarse() -> None:
@@ -1075,6 +1144,8 @@ def main() -> None:
     asyncio.run(test_index_cache_reuse())
     asyncio.run(test_dense_window_encoding())
     asyncio.run(test_index_cache_concurrent())
+    asyncio.run(test_embedding_fatal_on_error())
+    asyncio.run(test_coarse_fatal_embedding_not_swallowed())
     asyncio.run(test_bm25_and_coarse())
     test_postprocess_parent()
     test_neighbor_expansion()

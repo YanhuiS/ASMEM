@@ -4,9 +4,10 @@
 #   python -m asmem.api --config configs/api.yaml --port 8000
 #
 # This is the template for the competition service: 4o-mini generator (vision
-# captions for query images), local Qwen3-Embedding-4B on :30001, and the
-# bounded multi-hop search settings.  The API key is intentionally empty here;
-# keep the filled copy in configs/api.yaml, which is gitignored.
+# captions for query images), the Bailian text-embedding-v4 endpoint (max 10
+# inputs per request), and the bounded multi-hop search settings.  The API key
+# is intentionally empty in the committed template; keep the filled copy in
+# configs/api.yaml, which is gitignored.
 #
 # Only add/search are served here: bench-only sections (experiment/answer/eval)
 # and their dataset-specific answer styles do not apply.
@@ -28,7 +29,7 @@ generator:
   # must include the `api.` prefix: http://.openlux.ai does not resolve.
   model: gpt-4o-mini
   base_url: https://api.openlux.ai/v1
-  api_key: 
+  api_key:
   temperature: 0.0
   max_tokens: 8192
   enable_thinking: false
@@ -37,7 +38,18 @@ generator:
   # retry budget is spent retrying rather than waiting on a kernel SYN timeout.
   timeout: 60
   connect_timeout: 5
-  max_retries: 2
+  # 3 attempts: a remote endpoint can drop a new connection under a short
+  # burst; two attempts (the previous value) turned one blip into
+  # stop=model_error.  Timeout/backoff still bound the whole call.
+  max_retries: 3
+
+# This deployment exports http_proxy/https_proxy pointing at a local AutoDL
+# proxy (172.20.0.19:12798) that is not always alive.  The remote generator
+# must connect directly: an inherited dead proxy produces
+# APIConnectionError/ConnectError("All connection attempts failed") before the
+# HTTP request ever leaves the box.  The embedding endpoint is also reached
+# directly (its host is in no_proxy, but keep it explicit).
+trust_env: false
 
 # The text JSON tool protocol from the system prompt (gpt-4o-mini also works
 # with native tools, but keeping one protocol for both configs avoids drift).
@@ -67,8 +79,10 @@ health_stats_ttl: 10
 # Consecutive transport failures that open the per-run model circuit breaker.
 llm_breaker_failures: 2
 # Also open a process-wide breaker so new searches fail fast into the coarse
-# fallback while the endpoint is down (0 disables).
-llm_global_breaker_failures: 8
+# fallback while the endpoint is down (0 disables).  A burst of dropped
+# connections should not trip it after one concurrent wave; 16 failures is
+# two full waves at concurrency 8.  A real outage still opens it quickly.
+llm_global_breaker_failures: 16
 llm_global_breaker_cooldown: 30
 # Preflight token cap + context-overflow shrink recovery.  This keeps a long
 # evidence/prompt from turning into a 400 or a long, slow generation.
@@ -79,7 +93,7 @@ verifier_max_output_tokens: 2048
 postagent_max_output_tokens: 4096
 # Optional shared secret.  Empty = no auth (the competition platform may not
 # send one).  When set, X-Api-Key / Authorization: Bearer|Token is required.
-api_key: ""
+api_key:
 
 # Postagent budget. The coarse stage seeds evidence.jsonl; six steps leave room
 # for a real multi-hop chain plus curation.
@@ -217,17 +231,23 @@ retrieval:
     b: 0.75
   dense:
     mode: "on"
-    # Local SGLang embedding server (Qwen3-Embedding-4B, 2560 dims).
-    model: qwen3-embedding-4b
-    base_url: http://127.0.0.1:30001/v1
-    api_key: 
-    batch_size: 16
+    # Bailian OpenAI-compatible embedding endpoint.  text-embedding-v4 accepts
+    # at most 10 inputs per request: batch_size must stay <= 10 (16 made every
+    # batch return 400, so dense was silently dead and coarse ran BM25-only).
+    model: text-embedding-v4
+    base_url: https://ws-dnct2qqi9s4mb64e.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    api_key:
+    batch_size: 8
     concurrency: 8
     max_retries: 3
+    trust_env: false
+    # 百炼欠费/额度耗尽时不要静默降级为 BM25：embedding 失败即抛错，
+    # HTTP 返回 503 并终止服务（见 api/server.py 的 EmbeddingError 分支）。
+    fatal_on_error: true
     # Cap a single embedding request; the search budget is above this.
     timeout: 60
-    dim: 2560
-    dimensions: 0
+    dim: 1024
+    dimensions: 1024
     query_prefix: "Instruct: Given a question, retrieve relevant memory records that answer it.\nQuery: "
     document_prefix: ""
     include_role: false
@@ -257,10 +277,21 @@ multimodal:
   max_response_images: 8
   max_query_images: 1
   return_images: true
+  # The competition contract is per *track*: multimodal Search responses must
+  # be ordered ContentPart[] even when this particular question is text-only.
+  # "auto" mirrors the request shape (text query -> string), which is correct
+  # for the text/code track but not for the multimodal track.
+  response_parts: always
   postagent_images: auto
 
+# Raw Add/Search request journal.  One file per unique payload (SHA-256),
+# inline base64 images externalized to the content-addressed image store.
+# This is the only reliable way to audit what the platform actually sent.
+request_journal: true
+request_journal_responses: true
+
 # API service settings.
-store_dir: data/api_store
+store_dir: data/api_store_mm
 concurrency: 8           # concurrent /search runs
 add_concurrency: 32      # concurrent /add requests
 top_k: 100               # default cap applied when a request omits top_k

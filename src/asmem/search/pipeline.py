@@ -31,6 +31,7 @@ from ..retrieval import (
     run_coarse,
     seed_evidence,
 )
+from ..retrieval.dense import EmbeddingError
 from ..retrieval.index import build_index
 from ..retrieval.postprocess import fallback_evidence
 from . import compiler, evidence, evidence_loop, prompts, verifier
@@ -278,6 +279,10 @@ async def _coarse_or_empty(
         return await run_coarse(
             memory_path, question, options=options, config=config,
             out_dir=inputs, cache_dir=cache_dir)
+    except EmbeddingError:
+        # A fatal embedding outage is not recoverable by retrying BM25-only:
+        # the caller must fail the search (and, in the API, stop the service).
+        raise
     except Exception as exc:  # noqa: BLE001 - coarse failure must not kill search
         # The usual failure here is the dense endpoint (timeout/connection).
         # Retry once with BM25-only before accepting an empty candidate pool.
@@ -606,6 +611,8 @@ async def run_search(
                         timeout=max(5.0, min(30.0, coarse_remaining)))
                     coarse.info.setdefault("warnings", []).append(
                         "dense coarse stage timed out; bm25 fallback")
+                except EmbeddingError:
+                    raise
                 except Exception:  # noqa: BLE001
                     coarse = CoarseResult(
                         candidates=[],
@@ -1190,6 +1197,9 @@ async def run_search(
                          f"final={verdict.sufficient} evidence={len(processed)}")
         evidence.write_file(qa / evidence.EVIDENCE_NAME, processed)
         raw_evidence = processed
+    except EmbeddingError:
+        # Do not turn an embedding outage into a degraded answer.
+        raise
     except Exception as exc:  # noqa: BLE001 - fallback beats a 5xx
         log.error(f"search failed, using coarse fallback: {type(exc).__name__}: {exc}")
         # Keep anything the agent already wrote: one bad model reply must not

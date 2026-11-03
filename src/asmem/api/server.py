@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -35,6 +36,7 @@ from fastapi.responses import JSONResponse
 from .. import multimodal as multimodal_mod
 from ..io import PROJECT_ROOT
 from ..log import Logger
+from ..retrieval.dense import EmbeddingError
 from ..search import evidence as search_evidence
 from ..search import runner
 from . import store as store_mod
@@ -256,6 +258,7 @@ class ApiState:
         self.inflight = 0
         self.tasks: set[asyncio.Task[Any]] = set()
         self.last_error = ""
+        self.fatal_triggered = False
         self._stats_cache: tuple[float, dict[str, int]] | None = None
 
     def store(self, user_id: str) -> store_mod.UserStore:
@@ -265,6 +268,26 @@ class ApiState:
     def note_error(self, message: str) -> None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.last_error = f"{stamp} {message}"
+
+    def fatal_soon(self, message: str) -> None:
+        """Stop the service after a non-degradable failure.
+
+        Called from a route or from a background task's done callback.  The
+        triggering request still gets a 503, then SIGTERM lets uvicorn drain
+        in-flight searches; a watchdog hard-exits if the drain hangs.
+        """
+        if self.fatal_triggered:
+            return
+        self.fatal_triggered = True
+        self.accepting = False
+        self.note_error(message)
+        self.log.error(f"{message} — shutting down")
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.2, os.kill, os.getpid(), signal.SIGTERM)
+        loop.call_later(max(15.0, self.shutdown_timeout + 10.0), os._exit, 1)
+
+    async def fatal(self, message: str) -> None:
+        self.fatal_soon(message)
 
     def stats(self) -> dict[str, int]:
         """Aggregate cheap per-user counters (cached for ``health_stats_ttl``)."""
@@ -312,9 +335,16 @@ class ApiState:
             if finished.cancelled():
                 return
             exc = finished.exception()
+            if exc is None:
+                return
+            if isinstance(exc, EmbeddingError):
+                # A detached (request_id) run has no route left to catch it.
+                self.fatal_soon(
+                    f"background search hit a fatal embedding failure: {exc}")
+                return
             # A hard timeout is handled by the route (it returns the coarse
             # fallback); do not record it as a background crash.
-            if exc is not None and not isinstance(exc, asyncio.TimeoutError):
+            if not isinstance(exc, asyncio.TimeoutError):
                 self.note_error(
                     f"background search failed: {type(exc).__name__}: {exc}")
 
@@ -639,6 +669,13 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                     shared_dir=store.shared_dir,
                     request_id=request_id, user_id=request.user_id,
                     query_images=query_images, fallback_path=fallback_path)
+            except EmbeddingError as exc:
+                # Stop the process from here so the log carries user/request
+                # context (this also covers runs that outlive a disconnect).
+                state.fatal_soon(
+                    f"fatal embedding failure user={request.user_id} "
+                    f"request={request_id or '-'}: {exc}")
+                raise
             except asyncio.TimeoutError as exc:
                 if not acquired:
                     raise SearchQueueTimeout(
@@ -726,6 +763,15 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 return await _fallback_response("queue timeout")
             except asyncio.TimeoutError:
                 return await _fallback_response("hard timeout", note_error=True)
+            except EmbeddingError as exc:
+                # A dead embedding backend is not a degraded answer: fail the
+                # request and stop the service instead of running BM25-only.
+                await state.fatal(
+                    f"fatal embedding failure user={request.user_id} "
+                    f"request={request_id or '-'}: {exc}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="embedding backend unavailable; shutting down")
             except Exception as exc:  # noqa: BLE001 - protocol never sees a 5xx
                 state.note_error(
                     f"search failed user={request.user_id} "

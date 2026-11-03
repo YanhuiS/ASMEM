@@ -214,6 +214,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "batch_size": 16, "concurrency": 4, "max_retries": 3,
             "dim": 128, "dimensions": 0, "query_prefix": "",
             "document_prefix": "", "include_role": False,
+            # When true, an embedding-backend failure raises EmbeddingError
+            # instead of silently dropping the dense channel (API turns that
+            # into a 503 and shuts the service down).
+            "fatal_on_error": False,
             # Long records are encoded in overlapping token windows (max-pooled).
             "max_tokens": 320, "overlap_tokens": 40,
             # Legacy char window, used when max_tokens is 0.

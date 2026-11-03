@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+class EmbeddingError(RuntimeError):
+    """Embedding backend failure that the caller must not degrade past.
+
+    Raised only when ``retrieval.dense.fatal_on_error`` is enabled; the
+    default keeps dense optional and turns a dead endpoint into a warning.
+    """
+
+
 def _l2(vector: Sequence[float]) -> list[float]:
     norm = math.sqrt(sum(value * value for value in vector)) or 1.0
     return [float(value) / norm for value in vector]

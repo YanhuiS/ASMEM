@@ -27,7 +27,7 @@ from ..schema import (
 )
 from ..state import derive_state
 from .bm25 import BM25Index
-from .dense import EmbeddingCache, build_embedder, cache_lock
+from .dense import EmbeddingCache, EmbeddingError, build_embedder, cache_lock
 from .tokenize import normalize_text, terms, tokenize
 
 _DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
@@ -195,6 +195,9 @@ class RetrievalIndex:
     embedding_usage_total: dict[str, int] = field(default_factory=dict)
     embedder_identity: str = ""
     dense_error: str = ""
+    #: ``retrieval.dense.fatal_on_error``: raise :class:`EmbeddingError`
+    #: instead of silently dropping the dense channel.
+    dense_fatal: bool = False
     manifest_path: Path | None = None
     stats: dict[str, Any] = field(default_factory=dict)
 
@@ -302,8 +305,10 @@ class RetrievalIndex:
         try:
             query_vectors = await self.embedder.embed(
                 views, kind="query", usage_out=usage)
-        except Exception as exc:  # noqa: BLE001 - dense is optional
+        except Exception as exc:  # noqa: BLE001 - dense is optional by default
             self.dense_error = f"{type(exc).__name__}: {exc}"
+            if self.dense_fatal:
+                raise EmbeddingError(self.dense_error) from exc
             return []
         for key, value in usage.items():
             self.embedding_usage_total[key] = (
@@ -359,6 +364,8 @@ async def build_index(
         ),
         state=derive_state(records),
         stats={"records": len(records)},
+        # Opt-in: an embedding outage is an error, not a silent BM25-only run.
+        dense_fatal=bool(dense_cfg.get("fatal_on_error", False)),
     )
     if not records:
         return index
@@ -437,11 +444,13 @@ async def build_index(
                     await asyncio.to_thread(cache.save)
             finally:
                 cache.close()
-    except Exception as exc:  # noqa: BLE001 - dense is optional
+    except Exception as exc:  # noqa: BLE001 - dense is optional by default
         index.dense_error = f"{type(exc).__name__}: {exc}"
         index.vectors = None
         index.vector_groups = None
         index.stats.update(stats)
+        if index.dense_fatal:
+            raise EmbeddingError(index.dense_error) from exc
         return index
 
     index.stats.update(stats)
@@ -453,6 +462,8 @@ async def build_index(
         index.dense_error = "some embeddings are missing"
         index.vectors = None
         index.vector_groups = None
+        if index.dense_fatal:
+            raise EmbeddingError(index.dense_error)
         return index
     index.vector_groups = groups
     index.vectors = [group[0] for group in groups]
